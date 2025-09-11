@@ -21,7 +21,6 @@ import pickle
 import tifffile as tf
 import re
 import zarr
-import cv2
 from sklearn.mixture import GaussianMixture
 from scipy.stats import norm
 from skimage.measure import block_reduce
