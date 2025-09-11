@@ -73,6 +73,21 @@ def make_msi(exe):
     )
 
 
+def make_macos_app_bundle(exe):
+
+    bundle = MacOsApplicationBundleBuilder("Gater")
+    bundle.set_info_plist_required_keys(
+        display_name="Gater",
+        identifier="org.labsyspharm.gater",
+        version="1.32",
+        signature="????",
+        executable="gater",
+    )
+    bundle.add_macos_manifest(exe.to_file_manifest("."))
+
+    return bundle
+
+
 # Dynamically enable automatic code signing.
 def register_code_signers():
     # You will need to run with `pyoxidizer build --var ENABLE_CODE_SIGNING 1` for
@@ -113,6 +128,7 @@ register_target("exe", make_exe)
 register_target("resources", make_embedded_resources, depends=["exe"], default_build_script=True)
 register_target("install", make_install, depends=["exe"], default=True)
 register_target("msi_installer", make_msi, depends=["exe"])
+register_target("macos_app_bundle", make_macos_app_bundle, depends=["exe"])
 
 # Resolve whatever targets the invoker of this configuration file is requesting
 # be resolved.
