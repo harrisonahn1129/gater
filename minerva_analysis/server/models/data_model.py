@@ -11,6 +11,7 @@ from pathlib import PurePath
 from ome_types import from_xml
 from minerva_analysis import config_json_path, data_path, cwd_path
 from minerva_analysis.server.utils import pyramid_assemble, pyramid_upgrade
+from minerva_analysis.server.utils.omero_zarr_to_ometiff import omero_zarr_to_ometiff
 from minerva_analysis.server.models import database_model
 from minerva_analysis.server.utils import smallestenclosingcircle
 import matplotlib.path as mpltPath
@@ -34,6 +35,7 @@ seg = None
 zarray = None
 channels = None
 metadata = None
+_channel_axes = None  # tifffile axes string (e.g. 'CYX', 'IYX', 'YXS')
 
 
 def init(datasource_name):
@@ -48,6 +50,7 @@ def load_datasource(datasource_name, reload=False):
     global zarray
     global channels
     global metadata
+    global _channel_axes
     if source is datasource_name and datasource is not None and reload is False:
         return
     load_config(datasource_name)
@@ -72,13 +75,33 @@ def load_datasource(datasource_name, reload=False):
         metadata = from_xml(xml).images[0].pixels
     except:
         metadata = {}
+    _channel_axes = channel_io.series[0].axes
     channels = zarr.open(channel_io.series[0].aszarr())
 
+    # Find spatial dimension indices for level selection.
+    # Handles CYX/IYX (channel-first) and YXS (interleaved RGB).
+    if 'Y' in _channel_axes and 'X' in _channel_axes:
+        _y_idx = _channel_axes.index('Y')
+        _x_idx = _channel_axes.index('X')
+    else:
+        _y_idx, _x_idx = 1, 2
+
     level_series = next(
-        level for level in reversed(channel_io.series[0].levels)
-        if all(d >= 200 for d in level.shape[1:])
+        (level for level in reversed(channel_io.series[0].levels)
+         if level.shape[_y_idx] >= 200 and level.shape[_x_idx] >= 200),
+        channel_io.series[0]  # fallback to full resolution
     )
     zarray = zarr.open(level_series.aszarr())
+
+    # Normalize zarray to CYX so downstream histogram code works unchanged
+    if 'S' in _channel_axes:
+        zarray = np.transpose(np.asarray(zarray), (2, 0, 1))
+
+    # Scale uint8 data to full uint16 range so histogram min/max values
+    # match the scaled tile values served to the WebGL viewer.
+    if hasattr(zarray, 'dtype') and zarray.dtype == np.uint8:
+        zarray = np.asarray(zarray).astype(np.uint16) * np.uint16(257)
+
     if zarray.shape[1] > 400 or zarray.shape[2] > 400:
         x_reduce = zarray.shape[1] // 200
         y_reduce = zarray.shape[2] // 200
@@ -821,6 +844,7 @@ def generate_zarr_png(datasource_name, channel, level, tile):
         load_datasource(datasource_name)
     global channels
     global seg
+    global _channel_axes
     [tx, ty] = tile.replace('.png', '').split('_')
     tx = int(tx)
     ty = int(ty)
@@ -842,10 +866,20 @@ def generate_zarr_png(datasource_name, channel, level, tile):
         tile = np.append(tile, np.zeros((tile.shape[0], tile.shape[1], 1), dtype='uint8'), axis=2)
     else:
         if isinstance(channels, zarr.Array):
-            tile = channels[channel_num, iy:iy + tile_height, ix:ix + tile_width]
+            if 'S' in _channel_axes:
+                tile = channels[iy:iy + tile_height, ix:ix + tile_width, channel_num]
+            else:
+                tile = channels[channel_num, iy:iy + tile_height, ix:ix + tile_width]
         else:
-            tile = channels[level][channel_num, iy:iy + tile_height, ix:ix + tile_width]
-            tile = tile.astype('uint16')
+            if 'S' in _channel_axes:
+                tile = channels[level][iy:iy + tile_height, ix:ix + tile_width, channel_num]
+            else:
+                tile = channels[level][channel_num, iy:iy + tile_height, ix:ix + tile_width]
+        # ViaWebGL only renders u16/u32 textures; ensure channel tiles are uint16.
+        # Scale uint8 to full uint16 range (0-255 → 0-65535) so values are
+        # visible against the client's hardcoded imageBitRange of [0, 65536].
+        if tile.dtype == np.uint8:
+            tile = tile.astype(np.uint16) * np.uint16(257)
 
     # tile = np.ascontiguousarray(tile, dtype='uint32')
     # png = tile.view('uint8').reshape(tile.shape + (-1,))[..., [2, 1, 0]]
@@ -875,14 +909,36 @@ def convertOmeTiff(filePath, channelFilePath=None, dataDirectory=None, isLabelIm
             channel_info['maxLevel'] = len(channels)
             shape = channels[0].shape
             chunks = (1, 1024, 1024)
-        chunks = (chunks[-2], chunks[-1])
-        channel_info['tileHeight'] = chunks[0]
-        channel_info['tileWidth'] = chunks[1]
-        channel_info['height'] = shape[1]
-        channel_info['width'] = shape[2]
-        channel_info['num_channels'] = shape[0]
-        for i in range(shape[0]):
-            channelName = re.sub(r'\.ome\.tiff|\.ome\.tif|\.tiff|\.tif|\.png', '', filePath.name) + "_" + str(i)
+
+        # Determine dimension indices from tifffile axes metadata.
+        # Handles CYX/IYX (channel-first) and YXS (interleaved RGB).
+        axes = channel_io.series[0].axes
+        if 'S' in axes:
+            c_dim = axes.index('S')
+        elif 'C' in axes:
+            c_dim = axes.index('C')
+        elif 'I' in axes:
+            c_dim = axes.index('I')
+        elif len(shape) == 2:
+            c_dim = None
+        else:
+            c_dim = 0
+        y_dim = axes.index('Y') if 'Y' in axes else (0 if c_dim != 0 else 1)
+        x_dim = axes.index('X') if 'X' in axes else (1 if c_dim != 1 else 2)
+
+        num_channels = shape[c_dim] if c_dim is not None else 1
+        # Cap tile sizes to 1024 — non-tiled images have chunks equal to full
+        # image dimensions, which would create single-tile requests too large
+        # for the browser.
+        raw_th = chunks[y_dim] if len(chunks) > y_dim else 1024
+        raw_tw = chunks[x_dim] if len(chunks) > x_dim else 1024
+        channel_info['tileHeight'] = min(raw_th, 1024)
+        channel_info['tileWidth'] = min(raw_tw, 1024)
+        channel_info['height'] = shape[y_dim]
+        channel_info['width'] = shape[x_dim]
+        channel_info['num_channels'] = num_channels
+        for i in range(num_channels):
+            channelName = re.sub(r'\.ome\.tiff|\.ome\.tif|\.tiff|\.tif|\.png|\.svs|\.ndpi|\.qptiff', '', filePath.name) + "_" + str(i)
             channelNames.append(channelName)
         channel_info['channel_names'] = channelNames
         return channel_info
@@ -892,18 +948,28 @@ def convertOmeTiff(filePath, channelFilePath=None, dataDirectory=None, isLabelIm
         channel_io = tf.TiffFile(str(channelFilePath), is_ome=False)
         channels = zarr.open(channel_io.series[0].aszarr())
         write_path = None
-        directory = Path(dataDirectory + "/" + filePath.name)
-        segmentation_mask = tf.TiffFile(str(filePath), is_ome=False)
-        if segmentation_mask.series[0].aszarr().is_multiscales is False:
-            args = {}
-            args['in_paths'] = [Path(filePath)]
-            args['out_path'] = directory
-            args['is_mask'] = True
-            pyramid_assemble.main(py_args=args)
-            pyramid_upgrade.main(py_args=args)
+
+        # Handle .zarr segmentation masks (OMERO OME-NGFF)
+        if str(filePath).endswith('.zarr'):
+            zarr_stem = Path(filePath).stem
+            directory = Path(dataDirectory) / (zarr_stem + '.ome.tif')
+            if not directory.exists():
+                omero_zarr_to_ometiff(Path(filePath), output_path=directory)
             write_path = str(directory)
         else:
-            write_path = str(filePath)
+            # Existing TIFF path
+            directory = Path(dataDirectory + "/" + filePath.name)
+            segmentation_mask = tf.TiffFile(str(filePath), is_ome=False)
+            if segmentation_mask.series[0].aszarr().is_multiscales is False:
+                args = {}
+                args['in_paths'] = [Path(filePath)]
+                args['out_path'] = directory
+                args['is_mask'] = True
+                pyramid_assemble.main(py_args=args)
+                pyramid_upgrade.main(py_args=args)
+                write_path = str(directory)
+            else:
+                write_path = str(filePath)
         return {'segmentation': write_path}
 
 
@@ -957,7 +1023,11 @@ def get_cells_in_lassos(datasource_name, list_lassos):
     list_ids = list(set(list_ids))
     list_ids.sort()
 
-    list_ids_subtract = list(set(datasource['CellID']) - set(list_ids))
+    if 'idField' in config[datasource_name]['featureData'][0]:
+        idField = config[datasource_name]['featureData'][0]['idField']
+    else:
+        idField = "CellID"
+    list_ids_subtract = list(set(datasource[idField]) - set(list_ids))
     list_ids_subtract.sort()
 
     packet = {'lasso_ids': list_ids, 'lasso_ids_subtract': list_ids_subtract}

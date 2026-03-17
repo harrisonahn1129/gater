@@ -35,16 +35,44 @@ function update() {
     }
 }
 
-//check if path and channel file exist in the specified MCMICRO output foder
+//check if path exists and contains .ome.tif and .csv files
 async function checkMCOutputFolder(caller) {
-    let path_res = await checkPathExistence(caller);
-    if (path_res == true) {
-        let channel_res = await checkChannelExistence(caller)
-        if (channel_res == false) {
-            d3.select("#" + 'mcmicro_path_validation_text').html('No image channel file found under this path.')
+    let inputField = d3.select('#' + caller.id);
+    let path = inputField.property("value");
+
+    try {
+        let response = await fetch('/check_mc_output_folder', {
+            method: 'POST',
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({path: path})
+        });
+        let result = await response.json();
+
+        if (!result.path_exists) {
+            inputField.attr("class", "form-control is-invalid");
+            inputField.node().setCustomValidity('Path does not exist.');
+            d3.select("#mcmicro_path_validation_text").html('Please provide a valid path.');
+        } else if (!result.has_ome_tif && !result.has_csv) {
+            inputField.attr("class", "form-control is-invalid");
+            inputField.node().setCustomValidity('Invalid');
+            d3.select("#mcmicro_path_validation_text").html('No .ome.tif or .csv files found in this directory.');
+        } else if (!result.has_ome_tif) {
+            inputField.attr("class", "form-control is-invalid");
+            inputField.node().setCustomValidity('Invalid');
+            d3.select("#mcmicro_path_validation_text").html('No .ome.tif file found in this directory.');
+        } else if (!result.has_csv) {
+            inputField.attr("class", "form-control is-invalid");
+            inputField.node().setCustomValidity('Invalid');
+            d3.select("#mcmicro_path_validation_text").html('No .csv file found in this directory.');
+        } else {
+            inputField.attr("class", "form-control is-valid");
+            inputField.node().setCustomValidity('');
         }
-    } else {
-        d3.select("#" + 'mcmicro_path_validation_text').html('Please provide a valid path.')
+    } catch (e) {
+        console.log("Error checking MCMICRO output folder", e);
     }
 }
 
@@ -89,49 +117,6 @@ async function checkCSVFileExistence(caller) {
         console.log("Error While Checking for CSV File Existence", e);
     }
 }
-
-//check the existence of the channel file (MCMICRO specific)
-async function checkChannelExistence(caller) {
-    const self = this;
-
-    //get folder path from the input text field
-    let pathInputField = d3.select('#' + caller.id);
-    let path = pathInputField.property("value");
-
-    let imageSelectionField = d3.select('#' + caller.id);
-    let image = imageSelectionField.property("value");
-
-    try {
-        //check if corresponsindg csv file exists
-        let response = await fetch('/check_mc_channel_file_existence', {
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(
-                {
-                    path: path,
-                    image: image
-                }
-            )
-        });
-        let response_data = await response.json();
-        if (response_data == true) {
-            pathInputField.attr("class", "form-control is-valid");
-            pathInputField.node().setCustomValidity('');
-        } else {
-            // d3.select("#" + 'mcmicro_path_validation_text').html('No image channel file found under this path.')
-            pathInputField.attr("class", "form-control is-invalid");
-            pathInputField.node().setCustomValidity('No image channel file found under this path.');
-        }
-        // pathInputField.node().reportValidity();
-        return response_data;
-    } catch (e) {
-        console.log("Error While Checking for Image Channel File Existence", e);
-    }
-}
-
 
 //check if path exists (mcmicro naming specific)
 async function checkFileExistence(caller) {
@@ -198,42 +183,6 @@ async function checkDatasetExistence(caller) {
         } else {
             inputField.attr("class", "form-control is-invalid");
             inputField.node().setCustomValidity('Dataset name already exists. Choose a different name.');
-        }
-        // inputField.node().reportValidity();
-        return response_data;
-    } catch (e) {
-        console.log("Error Getting Segmentation File List", e);
-    }
-}
-
-//check if path exists (mcmicro naming specific)
-async function checkPathExistence(caller) {
-    const self = this;
-    let inputField = d3.select('#' + caller.id);
-    //get segmentation folder path from the input text field
-    let path = inputField.property("value");
-
-    try {
-        //get available segmentation masks in mcmicro directory from server
-        let response = await fetch('/check_path_existence', {
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(
-                {
-                    path: path,
-                }
-            )
-        });
-        let response_data = await response.json();
-        if (response_data == true) {
-            inputField.attr("class", "form-control is-valid");
-            inputField.node().setCustomValidity('');
-        } else {
-            inputField.attr("class", "form-control is-invalid");
-            inputField.node().setCustomValidity('Path does not exist.');
         }
         // inputField.node().reportValidity();
         return response_data;

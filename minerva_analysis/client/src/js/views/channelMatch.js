@@ -51,7 +51,7 @@ function channelMatch(data) {
         // Y Position
         let yIndex = _.findIndex(headers, e => {
             let str = _.get(e, 'fullName') || e;
-            return str == 'CellPosition_Y' || str == 'Y_centroid'
+            return str == 'CellPosition_Y' || str == 'Y_centroid' || str == 'Centroid_y'
         });
         if (yIndex != -1) {
             val = headers[yIndex]
@@ -62,7 +62,7 @@ function channelMatch(data) {
         // X Position
         let xIndex = _.findIndex(headers, e => {
             let str = _.get(e, 'fullName') || e;
-            return str == 'CellPosition_X' || str == 'X_centroid'
+            return str == 'CellPosition_X' || str == 'X_centroid' || str == 'Centroid_x'
         });
         if (xIndex != -1) {
             val = headers[xIndex]
@@ -84,7 +84,7 @@ function channelMatch(data) {
         // CellId Position
         let cellIdIndex = _.findIndex(headers, e => {
             let str = _.get(e, 'fullName') || e;
-            return str == 'CellID';
+            return str == 'CellID' || str == 'object';
         });
         if (cellIdIndex != -1) {
             val = headers[cellIdIndex]
@@ -115,7 +115,19 @@ function channelMatch(data) {
     //let markers_notToNorm = ['Field_Row', 'Field_Col', 'CellID', 'Area', 'X_centroid', 'Y_centroid', 'X_position', 'Y_position', 'Percent_Touching', 'Number_Neighbors', 'Neighbor_1', 'Neighbor_2', 'Neighbor_3', 'Neighbor_4', 'Neighbor_5', 'Eccentricity', 'Solidity', 'Extent', 'EulerNumber', 'Perimeter', 'column_centroid', 'row_centroid', 'MajorAxisLength', 'MinorAxisLength', 'Orientation', 'X_position', 'Y_position', 'phenotype']
     let markers_notToTransform = headers.map(marker => marker['fullName']).filter(marker => !marker.includes(data['substring']));
     markers_notToTransform.push(headers.map(marker => marker['fullName'])[0])
-    markers_notToTransform.push('CellID', 'X_centroid', 'Y_centroid', 'Area', 'MajorAxisLength', 'MinorAxisLength', 'Eccentricity', 'Solidity', 'Extent', 'Orientation', 'column_centroid', 'row_centroid', 'phenotype')
+    markers_notToTransform.push(
+        // mcmicro conventions
+        'CellID', 'X_centroid', 'Y_centroid', 'Area', 'MajorAxisLength', 'MinorAxisLength',
+        'Eccentricity', 'Solidity', 'Extent', 'Orientation', 'column_centroid', 'row_centroid', 'phenotype',
+        // OMERO table conventions
+        'object', 'prob', 'geometry', 'centroid',
+        'Bbox_min_x', 'Bbox_min_y', 'Bbox_max_x', 'Bbox_max_y',
+        'tile_index', 'orig_object',
+        'Perimeter', 'Centroid_x', 'Centroid_y',
+        'Longest_axis', 'Convexity', 'Compactness_circle', 'Compactness_square',
+        'Area_convex', 'Min_rot_rect', 'Elongation',
+        'Major_axis', 'Minor_axis', 'Circular_diameter', 'Euler_number'
+    )
     _.each(headers, (header, i) => {
         let fullName = _.get(header, 'fullName') || header;
         if (!_.includes(markers_notToTransform, fullName)) {

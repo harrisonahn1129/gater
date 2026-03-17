@@ -4,6 +4,9 @@
 # sys.path.append('/c/Users/Sophie/minerva_analysis/')
 from minerva_analysis import app, get_config_names, config_json_path, data_path, cwd_path
 from minerva_analysis.server.utils import mostFrequentLongestSubstring, pre_normalization
+from minerva_analysis.server.utils.wsi_to_ometiff import wsi_to_ometiff
+from minerva_analysis.server.utils.qptiff_to_ometiff import qptiff_to_ometiff
+from minerva_analysis.server.utils.omero_csv_to_mcmicro import is_omero_csv, omero_csv_to_mcmicro
 from minerva_analysis.server.models import data_model
 
 from flask import render_template, request, Response, jsonify
@@ -20,6 +23,49 @@ import orjson
 import os
 from os import walk
 import io
+
+
+# Extensions that need conversion before the OME-TIFF pipeline
+_WSI_EXTENSIONS = {'.svs', '.ndpi'}
+_QPTIFF_EXTENSIONS = {'.qptiff'}
+_ALL_SOURCE_EXTENSIONS = _WSI_EXTENSIONS | _QPTIFF_EXTENSIONS
+_NATIVE_EXTENSIONS = {'.tif', '.tiff', '.ome.tif', '.ome.tiff'}
+
+
+def _convert_channel_to_ometiff(input_path, output_dir):
+    """Convert a non-OME-TIFF channel image to OME-TIFF if needed.
+
+    Args:
+        input_path: Path to the input channel file (.svs, .ndpi, .qptiff, or .tif).
+        output_dir: Directory to write the converted file into.
+
+    Returns:
+        Path to the converted .ome.tif file, or the original path if already
+        a native TIFF format.
+    """
+    input_path = Path(input_path)
+    ext = input_path.suffix.lower()
+
+    # Already a native TIFF — no conversion needed
+    # Check for .ome.tif/.ome.tiff (double suffix) first
+    if ''.join(input_path.suffixes[-2:]).lower() in ('.ome.tif', '.ome.tiff'):
+        return input_path
+    if ext in _NATIVE_EXTENSIONS:
+        return input_path
+
+    output_path = Path(output_dir) / (input_path.stem + '.ome.tif')
+
+    if ext in _WSI_EXTENSIONS:
+        wsi_to_ometiff(input_path, output_path=output_path)
+    elif ext in _QPTIFF_EXTENSIONS:
+        qptiff_to_ometiff(input_path, output_path=output_path)
+    else:
+        raise ValueError(
+            f"Unsupported channel image format '{ext}'. "
+            f"Supported: {', '.join(sorted(_ALL_SOURCE_EXTENSIONS | _NATIVE_EXTENSIONS))}"
+        )
+
+    return output_path
 
 
 total_tasks = 100
@@ -236,18 +282,35 @@ def upload_file_page():
                 file_path = str(PurePath(Path.cwd(), data_path, datasetName))
                 if not Path(file_path).exists(): # If no directory for existing name for dataset input will create one
                     Path(file_path).mkdir()
-                total_tasks = 2
 
+                # Convert non-OME-TIFF channel images (SVS, NDPI, QPTIFF)
+                needs_conversion = channelFile.suffix.lower() in _ALL_SOURCE_EXTENSIONS
+                total_tasks = 3 if needs_conversion else 2
+                if needs_conversion:
+                    current_task = "Converting channel image to OME-TIFF"
+                    channelFile = _convert_channel_to_ometiff(channelFile, file_path)
+                    completed_task += 1
 
                 # Process CSV File
 
-                #open original csv location
+                # open original csv location
                 csvFile = [open(csvPath)]
                 # file path to write to on server
-                f = open(str(Path(file_path) / csvName), 'w')
+                serverCsvPath = str(Path(file_path) / csvName)
+                f = open(serverCsvPath, 'w')
                 # write to new location on server
                 f.write(csvFile[0].read())
-                # read field names from new server location
+                f.close()
+                csvFile[0].close()
+
+                # Detect and convert OMERO CSV format to mcmicro format
+                with open(serverCsvPath, 'r') as probe:
+                    probe_header = csv.DictReader(probe).fieldnames
+                if is_omero_csv(probe_header):
+                    omero_csv_to_mcmicro(serverCsvPath)
+
+                # read field names from server location (possibly converted)
+                csvPath = Path(serverCsvPath)
                 with open(csvPath, 'r') as infile:
                     reader = csv.DictReader(infile)
                     csvHeader = reader.fieldnames
@@ -298,7 +361,25 @@ def upload_file_page():
                 config_data['datasources'].append(datasetName)
 
                 datasource = pd.read_csv(csvPath)
-                listNotMarkers = ['CellID', 'X_centroid', 'Y_centroid', 'Area', 'MajorAxisLength', 'MinorAxisLength', 'Eccentricity', 'Solidity', 'Extent', 'Orientation', 'column_centroid', 'row_centroid', 'phenotype']
+                # Columns that are metadata/morphology, not marker intensities.
+                # Includes both mcmicro and OMERO naming conventions.
+                listNotMarkers = [
+                    # mcmicro conventions
+                    'CellID', 'X_centroid', 'Y_centroid', 'Area',
+                    'MajorAxisLength', 'MinorAxisLength', 'Eccentricity',
+                    'Solidity', 'Extent', 'Orientation',
+                    'column_centroid', 'row_centroid', 'phenotype',
+                    # OMERO table conventions
+                    'object', 'prob', 'geometry', 'centroid',
+                    'Bbox_min_x', 'Bbox_min_y', 'Bbox_max_x', 'Bbox_max_y',
+                    'tile_index', 'orig_object',
+                    'Perimeter', 'Centroid_x', 'Centroid_y',
+                    'Longest_axis', 'Convexity',
+                    'Compactness_circle', 'Compactness_square',
+                    'Area_convex', 'Min_rot_rect', 'Elongation',
+                    'Major_axis', 'Minor_axis',
+                    'Circular_diameter', 'Euler_number',
+                ]
                 listImageData = [name for name in header_full_names if name not in listNotMarkers]
                 datasourceImageData = datasource[[*listImageData]]
                 if np.mean(np.mean(datasourceImageData)) < 15:
@@ -308,6 +389,9 @@ def upload_file_page():
 
                 return render_template('channel_match.html', data=config_data)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"upload error: {e}", flush=True)
             completed_task = -1
             current_task = str(e)
             return render_template('index.html')
@@ -502,6 +586,9 @@ def save_config():
             return resp
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"save_config error: {e}", flush=True)
         resp = jsonify(success=False)
         return resp
 
@@ -529,6 +616,10 @@ def list_tif_files_in_dir():
                     if (file_split[-1] == 'tif' and file_split[-2] == 'ome') or (file_split[-1] == 'tiff' and file_split[-2] == 'ome'):
                         file_path = os.path.join(dirpath, file)
                         files.append(file_path)
+                # Also discover .zarr directories (OMERO OME-NGFF segmentation masks)
+                for dirname in dirnames:
+                    if dirname.endswith('.zarr'):
+                        files.append(os.path.join(dirpath, dirname))
             print(files)
     else:
         print('error in segmentation path');
@@ -581,18 +672,32 @@ def check_mc_csv_file_existence():
 
     return serialize_and_submit_json(False)
 
-@app.route('/check_mc_channel_file_existence', methods=['POST'])
-def check_mc_channel_file_existence():
-    # path and type information from upload
+@app.route('/check_mc_output_folder', methods=['POST'])
+def check_mc_output_folder():
+    """Validate that an MCMICRO output folder contains .ome.tif and .csv files."""
     post_data = json.loads(request.data)
-    if 'path' in post_data:
+    result = {'path_exists': False, 'has_ome_tif': False, 'has_csv': False}
 
-        if 'image' in post_data:
-            path = Path(post_data['image'])
-            if path.suffix.lower() == '.tif' or '.tiff':
-                return serialize_and_submit_json(True)
+    if 'path' not in post_data:
+        return serialize_and_submit_json(result)
 
-    return serialize_and_submit_json(False)
+    path = Path(post_data['path'])
+    if not path.is_dir():
+        return serialize_and_submit_json(result)
+
+    result['path_exists'] = True
+
+    for dirpath, dirnames, filenames in walk(str(path)):
+        for f in filenames:
+            name_lower = f.lower()
+            if name_lower.endswith('.ome.tif') or name_lower.endswith('.ome.tiff'):
+                result['has_ome_tif'] = True
+            if name_lower.endswith('.csv'):
+                result['has_csv'] = True
+            if result['has_ome_tif'] and result['has_csv']:
+                return serialize_and_submit_json(result)
+
+    return serialize_and_submit_json(result)
 
 @app.route('/check_file_existence', methods=['POST'])
 def check_file_existence():
@@ -601,6 +706,9 @@ def check_file_existence():
     if 'path' in post_data:
         path = Path(post_data['path'])
         if path.is_file():
+            return serialize_and_submit_json(True)
+        # .zarr segmentation masks are directories
+        if path.suffix == '.zarr' and path.is_dir():
             return serialize_and_submit_json(True)
         return serialize_and_submit_json(False)
 

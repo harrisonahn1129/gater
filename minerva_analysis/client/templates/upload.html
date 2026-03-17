@@ -122,10 +122,10 @@
                                 <label for="mcmicro_images">Choose an image file:</label>
                             </div>
                             <div class="col-auto">
-                              <select id="mcmicro_images" class="form-control" name="images" required onchange="checkChannelExistence(this);">
+                              <select id="mcmicro_images" class="form-control" name="images" required onchange="checkFileExistence(this);">
                               </select>
                                 <div class="valid-feedback">Valid.</div>
-                                <div class="invalid-feedback" id="mcmicro_mask_validation_text">
+                                <div class="invalid-feedback">
                                     No image files found under this path.
                                 </div>
                             </div>
@@ -135,11 +135,11 @@
                                 <label for="mcmicro_seg">Choose a segmentation file:</label>
                             </div>
                             <div class="col-auto">
-                              <select id="mcmicro_seg" class="form-control" name="segs" required onchange="checkChannelExistence(this);">
+                              <select id="mcmicro_seg" class="form-control" name="segs" required onchange="checkFileExistence(this);">
                               </select>
                                 <div class="valid-feedback">Valid.</div>
-                                <div class="invalid-feedback" id="mcmicro_mask_validation_text">
-                                    No image files found under this path.
+                                <div class="invalid-feedback">
+                                    No segmentation files found under this path.
                                 </div>
                             </div>
                         </div>

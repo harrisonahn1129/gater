@@ -32,3 +32,4 @@ dependencies:
       - ome-types==0.3.3
       - pydantic==1.10.10
       - imagecodecs[all]
+      - qptifffile
