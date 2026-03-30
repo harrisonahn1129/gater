@@ -859,6 +859,9 @@ def generate_zarr_png(datasource_name, channel, level, tile):
     except AttributeError:
         segmentation = True
     if segmentation:
+        # Clamp level to available segmentation pyramid levels
+        if isinstance(seg, zarr.hierarchy.Group):
+            level = min(level, len(seg) - 1)
         tile = seg[level][iy:iy + tile_height, ix:ix + tile_width]
         if tile.dtype.itemsize != 4:
             tile = tile.astype(np.uint32)
@@ -871,10 +874,12 @@ def generate_zarr_png(datasource_name, channel, level, tile):
             else:
                 tile = channels[channel_num, iy:iy + tile_height, ix:ix + tile_width]
         else:
+            # Clamp level to available channel pyramid levels
+            clamped = min(level, len(channels) - 1)
             if 'S' in _channel_axes:
-                tile = channels[level][iy:iy + tile_height, ix:ix + tile_width, channel_num]
+                tile = channels[clamped][iy:iy + tile_height, ix:ix + tile_width, channel_num]
             else:
-                tile = channels[level][channel_num, iy:iy + tile_height, ix:ix + tile_width]
+                tile = channels[clamped][channel_num, iy:iy + tile_height, ix:ix + tile_width]
         # ViaWebGL only renders u16/u32 textures; ensure channel tiles are uint16.
         # Scale uint8 to full uint16 range (0-255 → 0-65535) so values are
         # visible against the client's hardcoded imageBitRange of [0, 65536].
@@ -891,6 +896,93 @@ def get_ome_metadata(datasource_name):
         load_datasource(datasource_name)
     global metadata
     return metadata
+
+
+def _build_channel_pyramid(input_path, output_path, tile_size=1024):
+    """Build SubIFD-based pyramidal OME-TIFF from a non-pyramidal channel image.
+
+    Reads each channel lazily via zarr, downsamples with 2x2 block averaging,
+    and writes all levels as SubIFDs.  Returns the total number of pyramid
+    levels, or None if the image is too small to benefit from a pyramid.
+    """
+    tif_in = tf.TiffFile(str(input_path), is_ome=False)
+    series = tif_in.series[0]
+    axes = series.axes
+    shape = series.shape
+    dtype = series.dtype
+
+    # Determine dimension layout
+    is_interleaved = 'S' in axes
+    if is_interleaved:
+        c_dim = axes.index('S')
+        y_dim = axes.index('Y')
+        x_dim = axes.index('X')
+    elif 'C' in axes:
+        c_dim = axes.index('C')
+        y_dim = axes.index('Y') if 'Y' in axes else 1
+        x_dim = axes.index('X') if 'X' in axes else 2
+    elif 'I' in axes:
+        c_dim = axes.index('I')
+        y_dim = axes.index('Y') if 'Y' in axes else 1
+        x_dim = axes.index('X') if 'X' in axes else 2
+    elif len(shape) == 2:
+        c_dim = None
+        y_dim, x_dim = 0, 1
+    else:
+        c_dim = 0
+        y_dim, x_dim = 1, 2
+
+    height, width = shape[y_dim], shape[x_dim]
+    num_channels = shape[c_dim] if c_dim is not None else 1
+
+    num_levels = int(np.ceil(np.log2(max(height, width) / tile_size))) + 1
+    if num_levels < 2:
+        tif_in.close()
+        return None
+
+    num_sub = num_levels - 1
+    src = zarr.open(series.aszarr(), mode='r')
+
+    print(f"Building channel pyramid: {num_channels}ch, {num_levels} levels, "
+          f"{width}x{height} {dtype}")
+
+    with tf.TiffWriter(str(output_path), bigtiff=True, ome=True) as tw:
+        for c in range(num_channels):
+            print(f"  Channel {c + 1}/{num_channels}...")
+            # Extract 2D channel data
+            if c_dim is None:
+                ch = np.asarray(src[:])
+            elif is_interleaved:
+                ch = np.asarray(src[:, :, c])
+            else:
+                ch = np.asarray(src[c])
+
+            # Level 0 — full resolution
+            tw.write(
+                ch,
+                tile=(tile_size, tile_size),
+                subifds=num_sub,
+                compression='zlib',
+            )
+
+            # Downsampled sub-levels
+            prev = ch
+            for _ in range(num_sub):
+                down = block_reduce(prev, (2, 2), np.mean)
+                if down.dtype != dtype:
+                    down = down.astype(dtype)
+                tw.write(
+                    down,
+                    tile=(tile_size, tile_size),
+                    subfiletype=1,
+                    compression='zlib',
+                )
+                prev = down
+            del ch
+
+    tif_in.close()
+    print(f"Channel pyramid written: {output_path} ({num_levels} levels)")
+    return num_levels
 
 
 def convertOmeTiff(filePath, channelFilePath=None, dataDirectory=None, isLabelImg=False):
@@ -938,9 +1030,39 @@ def convertOmeTiff(filePath, channelFilePath=None, dataDirectory=None, isLabelIm
         channel_info['width'] = shape[x_dim]
         channel_info['num_channels'] = num_channels
         for i in range(num_channels):
-            channelName = re.sub(r'\.ome\.tiff|\.ome\.tif|\.tiff|\.tif|\.png|\.svs|\.ndpi|\.qptiff', '', filePath.name) + "_" + str(i)
+            stem = re.sub(r'\.ome\.tiff|\.ome\.tif|\.tiff|\.tif|\.png|\.svs|\.ndpi|\.qptiff', '', filePath.name)
+            # Sanitize characters that break HTTP URLs (# is fragment separator,
+            # [] and spaces cause routing issues in tile request paths).
+            stem = re.sub(r'[#\[\] ]+', '_', stem)
+            stem = re.sub(r'_+', '_', stem).strip('_')
+            channelName = stem + "_" + str(i)
             channelNames.append(channelName)
         channel_info['channel_names'] = channelNames
+
+        # Build pyramid for non-pyramidal channel images so the client can
+        # request lower-resolution tiles at zoomed-out view levels.
+        if channel_info['maxLevel'] == 1 and dataDirectory is not None:
+            if max(channel_info['height'], channel_info['width']) > 1024:
+                pyr_name = re.sub(
+                    r'\.ome\.tiff$|\.ome\.tif$|\.tiff$|\.tif$', '',
+                    filePath.name
+                ) + '_pyramid.ome.tif'
+                pyr_path = Path(dataDirectory) / pyr_name
+                if not pyr_path.exists():
+                    num_levels = _build_channel_pyramid(filePath, pyr_path)
+                else:
+                    pyr_io = tf.TiffFile(str(pyr_path), is_ome=False)
+                    pyr_z = zarr.open(pyr_io.series[0].aszarr())
+                    num_levels = (len(pyr_z)
+                                  if isinstance(pyr_z, zarr.hierarchy.Group)
+                                  else 1)
+                    pyr_io.close()
+                if num_levels and num_levels > 1:
+                    channel_info['maxLevel'] = num_levels
+                    channel_info['channelFile'] = str(pyr_path)
+                    channel_info['tileHeight'] = 1024
+                    channel_info['tileWidth'] = 1024
+
         return channel_info
 
     # segmentation mask
@@ -970,7 +1092,15 @@ def convertOmeTiff(filePath, channelFilePath=None, dataDirectory=None, isLabelIm
                 write_path = str(directory)
             else:
                 write_path = str(filePath)
-        return {'segmentation': write_path}
+        # Count segmentation pyramid levels so config can reflect them.
+        seg_levels = 1
+        if write_path:
+            seg_io = tf.TiffFile(write_path, is_ome=False)
+            seg_z = zarr.open(seg_io.series[0].aszarr())
+            if isinstance(seg_z, zarr.hierarchy.Group):
+                seg_levels = len(seg_z)
+            seg_io.close()
+        return {'segmentation': write_path, 'maxLevel': seg_levels}
 
 
 def logTransform(csvPath, skip_columns=[]):

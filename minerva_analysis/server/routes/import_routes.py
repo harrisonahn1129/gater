@@ -317,7 +317,10 @@ def upload_file_page():
 
                 # Process Channel File
                 current_task = "Converting OME-TIFF Channels (This Will Take a While)"
-                channel_info = data_model.convertOmeTiff(channelFile, isLabelImg=False)
+                channel_info = data_model.convertOmeTiff(channelFile, dataDirectory=file_path, isLabelImg=False)
+                # If a pyramidal copy was built, use it as the channel file
+                if 'channelFile' in channel_info:
+                    channelFile = Path(channel_info['channelFile'])
                 channelFileNames.extend(channel_info['channel_names'])
                 completed_task += 1
 
@@ -341,7 +344,10 @@ def upload_file_page():
                 config_data['substring'] = mostFrequentLongestSubstring.find_substring(header_full_names)
                 config_data['datasetName'] = datasetName
 
-                config_data['maxLevel'] = channel_info['maxLevel']
+                # Use the maximum pyramid depth across channels and segmentation
+                # so the client can request the finest zoom levels available.
+                seg_max = label_info.get('maxLevel', 1)
+                config_data['maxLevel'] = max(channel_info['maxLevel'], seg_max)
                 config_data['height'] = channel_info['height']
                 config_data['width'] = channel_info['width']
                 config_data['segmentation'] = label_info['segmentation']
