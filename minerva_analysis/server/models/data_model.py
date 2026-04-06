@@ -27,6 +27,8 @@ from sklearn.mixture import GaussianMixture
 from scipy.stats import norm
 from skimage.measure import block_reduce
 
+import threading
+
 ball_tree = None
 database = None
 source = None
@@ -36,6 +38,79 @@ zarray = None
 channels = None
 metadata = None
 _channel_axes = None  # tifffile axes string (e.g. 'CYX', 'IYX', 'YXS')
+_load_lock = threading.Lock()  # Prevent concurrent load_datasource calls
+_omero_lock = threading.Lock()  # Serialize OMERO access (BlitzGateway is not thread-safe)
+
+# --- OMERO integration ---
+_omero_conn = None
+_omero_pixels_cache = {}  # image_id -> PrimaryPixels object
+
+
+def _ensure_omero_connection():
+    """Return a connected BlitzGateway, reusing or reconnecting as needed.
+
+    Must be called while holding _omero_lock.
+    """
+    global _omero_conn
+    if _omero_conn is not None and _omero_conn.isConnected():
+        _omero_conn.keepAlive()
+        return _omero_conn
+    from omero.gateway import BlitzGateway
+    # TODO: make host/port/credentials configurable
+    _omero_conn = BlitzGateway('root', 'omero', host='localhost', port=4064)
+    if not _omero_conn.connect():
+        raise ConnectionError("Failed to connect to OMERO server")
+    print("Connected to OMERO server")
+    return _omero_conn
+
+
+def _get_omero_tile(image_id, channel_num, x, y, w, h, level=0):
+    """Fetch a single-channel 2D tile from OMERO as a numpy array.
+
+    Mimics the local pyramid behavior: computes the max meaningful pyramid
+    level from image dimensions, clamps the requested level to that max,
+    then reads and downsamples from full resolution.  Returns the natural
+    tile size (no zero-padding), matching what tifffile/zarr returns.
+    """
+    with _omero_lock:
+        conn = _ensure_omero_connection()
+        if image_id not in _omero_pixels_cache:
+            image = conn.getObject('Image', image_id)
+            if image is None:
+                raise ValueError(f"OMERO image {image_id} not found")
+            full_w, full_h = image.getSizeX(), image.getSizeY()
+            max_level = int(np.ceil(np.log2(max(full_w, full_h) / w))) if max(full_w, full_h) > w else 0
+            _omero_pixels_cache[image_id] = {
+                'pixels': image.getPrimaryPixels(),
+                'sizeX': full_w,
+                'sizeY': full_h,
+                'max_level': max_level,
+            }
+        cache = _omero_pixels_cache[image_id]
+        full_w, full_h = cache['sizeX'], cache['sizeY']
+
+        level = min(level, cache['max_level'])
+        scale = 2 ** level
+
+        src_x = x * scale
+        src_y = y * scale
+        src_w = min(w * scale, full_w - src_x)
+        src_h = min(h * scale, full_h - src_y)
+
+        if src_w <= 0 or src_h <= 0:
+            return np.zeros((1, 1), dtype=np.uint16)
+
+        tile = cache['pixels'].getTile(0, channel_num, 0, (src_x, src_y, src_w, src_h))
+
+    # Downsample outside the lock (CPU work, no OMERO access needed)
+    if scale > 1:
+        pad_h = (scale - tile.shape[0] % scale) % scale
+        pad_w = (scale - tile.shape[1] % scale) % scale
+        if pad_h or pad_w:
+            tile = np.pad(tile, ((0, pad_h), (0, pad_w)), mode='constant')
+        tile = block_reduce(tile, (scale, scale), np.mean).astype(tile.dtype)
+
+    return tile
 
 
 def init(datasource_name):
@@ -53,62 +128,99 @@ def load_datasource(datasource_name, reload=False):
     global _channel_axes
     if source is datasource_name and datasource is not None and reload is False:
         return
-    load_config(datasource_name)
-    if reload:
-        load_ball_tree(datasource_name, reload=reload)
-    csvPath = Path(config[datasource_name]['featureData'][0]['src'])
-    print("Loading csv data.. (this can take some time)")
-    datasource = pd.read_csv(csvPath)
-    datasource['id'] = datasource.index
-    datasource = datasource.replace(-np.Inf, 0)
-    source = datasource_name
-    print("Loading segmentation.")
-    if config[datasource_name]['segmentation'].endswith('.zarr'):
-        seg = zarr.load(config[datasource_name]['segmentation'])
-    else:
-        seg_io = tf.TiffFile(config[datasource_name]['segmentation'], is_ome=False)
-        seg = zarr.open(seg_io.series[0].aszarr())
-    channel_io = tf.TiffFile(config[datasource_name]['channelFile'], is_ome=False)
-    print("Loading image descriptions.")
-    try:
-        xml = channel_io.pages[0].tags['ImageDescription'].value
-        metadata = from_xml(xml).images[0].pixels
-    except:
-        metadata = {}
-    _channel_axes = channel_io.series[0].axes
-    channels = zarr.open(channel_io.series[0].aszarr())
+    with _load_lock:
+        # Double-check after acquiring lock (another thread may have loaded)
+        if source is datasource_name and datasource is not None and reload is False:
+            return
+        load_config(datasource_name)
+        if reload:
+            load_ball_tree(datasource_name, reload=reload)
+        csvPath = Path(config[datasource_name]['featureData'][0]['src'])
+        print("Loading csv data.. (this can take some time)")
+        datasource = pd.read_csv(csvPath)
+        datasource['id'] = datasource.index
+        datasource = datasource.replace(-np.Inf, 0)
 
-    # Find spatial dimension indices for level selection.
-    # Handles CYX/IYX (channel-first) and YXS (interleaved RGB).
-    if 'Y' in _channel_axes and 'X' in _channel_axes:
-        _y_idx = _channel_axes.index('Y')
-        _x_idx = _channel_axes.index('X')
-    else:
-        _y_idx, _x_idx = 1, 2
+        # --- Load segmentation ---
+        print("Loading segmentation.")
+        if config[datasource_name]['segmentation'].endswith('.zarr'):
+            seg = zarr.load(config[datasource_name]['segmentation'])
+        else:
+            seg_io = tf.TiffFile(config[datasource_name]['segmentation'], is_ome=False)
+            seg = zarr.open(seg_io.series[0].aszarr())
 
-    level_series = next(
-        (level for level in reversed(channel_io.series[0].levels)
-         if level.shape[_y_idx] >= 200 and level.shape[_x_idx] >= 200),
-        channel_io.series[0]  # fallback to full resolution
-    )
-    zarray = zarr.open(level_series.aszarr())
+        # --- Load channel image ---
+        omero_image_id = config[datasource_name].get('omero_image_id')
+        channel_file = config[datasource_name].get('channelFile', '')
 
-    # Normalize zarray to CYX so downstream histogram code works unchanged
-    if 'S' in _channel_axes:
-        zarray = np.transpose(np.asarray(zarray), (2, 0, 1))
+        if omero_image_id and not channel_file:
+            # Pure OMERO mode: no local channel file, load everything from OMERO.
+            print(f"Loading channel data from OMERO image {omero_image_id}...")
+            metadata = {}
+            _channel_axes = 'CYX'
+            channels = None  # tiles fetched on demand via _get_omero_tile()
 
-    # Scale uint8 data to full uint16 range so histogram min/max values
-    # match the scaled tile values served to the WebGL viewer.
-    if hasattr(zarray, 'dtype') and zarray.dtype == np.uint8:
-        zarray = np.asarray(zarray).astype(np.uint16) * np.uint16(257)
+            with _omero_lock:
+                conn = _ensure_omero_connection()
+                omero_image = conn.getObject('Image', omero_image_id)
+                num_c = omero_image.getSizeC()
+                img_h = omero_image.getSizeY()
+                img_w = omero_image.getSizeX()
+                reduce_factor = max(1, max(img_h, img_w) // 200)
+                pixels = omero_image.getPrimaryPixels()
+                planes = []
+                for c in range(num_c):
+                    plane = pixels.getTile(0, c, 0, (0, 0, img_w, img_h))
+                    if plane.dtype == np.uint8:
+                        plane = plane.astype(np.uint16) * np.uint16(257)
+                    if reduce_factor > 1:
+                        plane = block_reduce(plane, (reduce_factor, reduce_factor), np.mean)
+                    planes.append(plane)
+            zarray = np.stack(planes)  # CYX
+            print(f"  OMERO histogram zarray: {zarray.shape}, dtype: {zarray.dtype}")
+        else:
+            # Local file mode (with or without OMERO tile serving).
+            channel_io = tf.TiffFile(channel_file, is_ome=False)
+            print("Loading image descriptions.")
+            try:
+                xml = channel_io.pages[0].tags['ImageDescription'].value
+                metadata = from_xml(xml).images[0].pixels
+            except:
+                metadata = {}
+            _channel_axes = channel_io.series[0].axes
+            channels = zarr.open(channel_io.series[0].aszarr())
 
-    if zarray.shape[1] > 400 or zarray.shape[2] > 400:
-        x_reduce = zarray.shape[1] // 200
-        y_reduce = zarray.shape[2] // 200
-        reduce = np.min([x_reduce, y_reduce])
-        zarray = block_reduce(zarray, (1, reduce, reduce), np.mean)
+            if 'Y' in _channel_axes and 'X' in _channel_axes:
+                _y_idx = _channel_axes.index('Y')
+                _x_idx = _channel_axes.index('X')
+            else:
+                _y_idx, _x_idx = 1, 2
 
-    print("Data loading done.")
+            level_series = next(
+                (level for level in reversed(channel_io.series[0].levels)
+                 if level.shape[_y_idx] >= 200 and level.shape[_x_idx] >= 200),
+                channel_io.series[0]
+            )
+            zarray = zarr.open(level_series.aszarr())
+
+            if 'S' in _channel_axes:
+                zarray = np.transpose(np.asarray(zarray), (2, 0, 1))
+
+            if hasattr(zarray, 'dtype') and zarray.dtype == np.uint8:
+                zarray = np.asarray(zarray).astype(np.uint16) * np.uint16(257)
+
+            if zarray.shape[1] > 400 or zarray.shape[2] > 400:
+                x_reduce = zarray.shape[1] // 200
+                y_reduce = zarray.shape[2] // 200
+                reduce = np.min([x_reduce, y_reduce])
+                zarray = block_reduce(zarray, (1, reduce, reduce), np.mean)
+
+            if omero_image_id:
+                print(f"  OMERO image {omero_image_id} will be used for tile serving.")
+
+        # Set source LAST — after all globals are fully initialized.
+        source = datasource_name
+        print("Data loading done.")
 
 
 def load_config(datasource_name):
@@ -868,7 +980,14 @@ def generate_zarr_png(datasource_name, channel, level, tile):
         tile = tile.view('uint8').reshape(tile.shape + (-1,))[..., [0, 1, 2]]
         tile = np.append(tile, np.zeros((tile.shape[0], tile.shape[1], 1), dtype='uint8'), axis=2)
     else:
-        if isinstance(channels, zarr.Array):
+        omero_image_id = config[datasource_name].get('omero_image_id')
+        if omero_image_id:
+            # OMERO path: fetch tile directly from server
+            tile = _get_omero_tile(
+                omero_image_id, channel_num, ix, iy, tile_width, tile_height,
+                level=level,
+            )
+        elif isinstance(channels, zarr.Array):
             if 'S' in _channel_axes:
                 tile = channels[iy:iy + tile_height, ix:ix + tile_width, channel_num]
             else:
