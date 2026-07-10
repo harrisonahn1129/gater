@@ -44,6 +44,8 @@ _omero_lock = threading.Lock()  # Serialize OMERO access (BlitzGateway is not th
 # --- OMERO integration ---
 _omero_conn = None
 _omero_pixels_cache = {}  # image_id -> PrimaryPixels object
+_omero_last_used = 0.0    # monotonic-ish time of last connection use
+_OMERO_IDLE_TIMEOUT = 45  # seconds; reconnect fresh after this much idle
 
 
 def _ensure_omero_connection():
@@ -51,66 +53,203 @@ def _ensure_omero_connection():
 
     Must be called while holding _omero_lock.
     """
-    global _omero_conn
-    if _omero_conn is not None and _omero_conn.isConnected():
-        _omero_conn.keepAlive()
+    global _omero_conn, _omero_last_used
+    now = time.time()
+    # Reuse the cached connection only if it was used recently. After an idle
+    # gap the Ice connection may have silently dropped, and *probing* a dead
+    # connection (isConnected/keepAlive) can HANG with no client timeout — which
+    # is what stalled save_config. So we never probe: if idle too long, we drop
+    # the connection and reconnect fresh (a fast, reliable operation).
+    if _omero_conn is not None and (now - _omero_last_used) < _OMERO_IDLE_TIMEOUT:
+        _omero_last_used = now
         return _omero_conn
+    if _omero_conn is not None:
+        try:
+            _omero_conn.close()
+        except Exception:
+            pass
+        _omero_conn = None
+        _omero_pixels_cache.clear()
+
     from omero.gateway import BlitzGateway
-    # TODO: make host/port/credentials configurable
-    _omero_conn = BlitzGateway('root', 'omero', host='localhost', port=4064)
+    # Host/port/credentials are env-configurable so the containerized app can
+    # reach the OMERO server by its service name (OMERO_HOST=omeroserver),
+    # while a host-run app defaults to localhost.
+    host = os.environ.get('OMERO_HOST', 'localhost')
+    port = int(os.environ.get('OMERO_PORT', '4064'))
+    user = os.environ.get('OMERO_USER', 'root')
+    password = os.environ.get('OMERO_PASSWORD', 'omero')
+    _omero_conn = BlitzGateway(user, password, host=host, port=port)
     if not _omero_conn.connect():
-        raise ConnectionError("Failed to connect to OMERO server")
-    print("Connected to OMERO server")
+        raise ConnectionError(
+            "Failed to connect to OMERO server at %s:%s" % (host, port))
+    _omero_last_used = now
+    print("Connected to OMERO server at %s:%s" % (host, port))
     return _omero_conn
 
 
-def _get_omero_tile(image_id, channel_num, x, y, w, h, level=0):
-    """Fetch a single-channel 2D tile from OMERO as a numpy array.
+# OMERO pixel type -> numpy dtype. OMERO's raw pixel data is big-endian.
+_OMERO_NP_DTYPE = {
+    'int8': '>i1', 'uint8': '>u1', 'int16': '>i2', 'uint16': '>u2',
+    'int32': '>i4', 'uint32': '>u4', 'float': '>f4', 'double': '>f8',
+}
 
-    Mimics the local pyramid behavior: computes the max meaningful pyramid
-    level from image dimensions, clamps the requested level to that max,
-    then reads and downsamples from full resolution.  Returns the natural
-    tile size (no zero-padding), matching what tifffile/zarr returns.
+
+def _omero_pixel_cache(image_id):
+    """Cache (per image) the pixels id, dtype, and resolution-level dims read
+    from OMERO's own pyramid. Must be called while holding _omero_lock."""
+    cache = _omero_pixels_cache.get(image_id)
+    if cache is None:
+        conn = _ensure_omero_connection()
+        image = conn.getObject('Image', image_id)
+        if image is None:
+            raise ValueError("OMERO image %s not found" % image_id)
+        pixels = image.getPrimaryPixels()
+        ptype = pixels.getPixelsType().getValue()
+        rps = conn.c.sf.createRawPixelsStore()
+        rps.setPixelsId(pixels.getId(), False)
+        # getResolutionDescriptions(): index 0 = full res, last = smallest.
+        levels = [(d.sizeX, d.sizeY) for d in rps.getResolutionDescriptions()]
+        rps.close()
+        cache = {'pid': pixels.getId(),
+                 'dtype': _OMERO_NP_DTYPE.get(ptype, '>u2'),
+                 'levels': levels}
+        _omero_pixels_cache[image_id] = cache
+    return cache
+
+
+def _get_omero_tile(image_id, channel_num, x, y, w, h, level=0):
+    """Fetch a single-channel 2D tile from OMERO for the client's UNIFORM
+    power-of-2 pyramid.
+
+    The Gater client and the segmentation .ome.tif use a uniform pyramid where
+    server ``level`` k means "full resolution downsampled by 2**k", and (x, y)
+    are pixel offsets in that level-k coordinate space. OMERO's own stored
+    pyramid, however, is typically SPARSE and non-power-of-two (e.g. an SVS
+    whole slide keeps levels at 1x, 1/4, 1/16, 1/32 only). Mapping the client
+    level straight onto the OMERO level index therefore mis-scales every level
+    except full-res and leaves most tiles blank once zoomed in.
+
+    So express the requested tile as a full-resolution pixel region, read it
+    from the finest OMERO level no coarser than needed, then block-average the
+    residual factor down to the target tile. This reconstructs exactly the
+    uniform pyramid the client and segmentation share, keeping channel tiles
+    aligned with the segmentation at every zoom -- and still size-safe on
+    gigapixel slides (a level-k tile only ever reads ~w*h pixels off OMERO).
     """
     with _omero_lock:
         conn = _ensure_omero_connection()
-        if image_id not in _omero_pixels_cache:
-            image = conn.getObject('Image', image_id)
-            if image is None:
-                raise ValueError(f"OMERO image {image_id} not found")
-            full_w, full_h = image.getSizeX(), image.getSizeY()
-            max_level = int(np.ceil(np.log2(max(full_w, full_h) / w))) if max(full_w, full_h) > w else 0
-            _omero_pixels_cache[image_id] = {
-                'pixels': image.getPrimaryPixels(),
-                'sizeX': full_w,
-                'sizeY': full_h,
-                'max_level': max_level,
-            }
-        cache = _omero_pixels_cache[image_id]
-        full_w, full_h = cache['sizeX'], cache['sizeY']
+        cache = _omero_pixel_cache(image_id)
+        levels = cache['levels']
+        n = len(levels)
+        full_w = float(levels[0][0])
 
-        level = min(level, cache['max_level'])
-        scale = 2 ** level
+        target_ds = float(2 ** int(level))       # client downsample vs full res
+        # OMERO level j downsample factor relative to full res (~[1, 4, 16, 32]).
+        ds = [full_w / lw for (lw, lh) in levels]
+        # Finest OMERO level no finer than needed: largest ds[j] <= target_ds, so
+        # we read the least data and block-average the residual (>=1x) down.
+        j = 0
+        for jj in range(n):
+            if ds[jj] <= target_ds + 1e-6:
+                j = jj
+            else:
+                break
+        extra = max(1, int(round(target_ds / ds[j])))   # residual downsample
 
-        src_x = x * scale
-        src_y = y * scale
-        src_w = min(w * scale, full_w - src_x)
-        src_h = min(h * scale, full_h - src_y)
+        lw, lh = levels[j]
+        # Full-res region this tile covers, mapped into OMERO level-j coords.
+        xj = int(round(x * target_ds / ds[j]))
+        yj = int(round(y * target_ds / ds[j]))
+        wj = min(int(round(w * target_ds / ds[j])), lw - xj)
+        hj = min(int(round(h * target_ds / ds[j])), lh - yj)
+        if wj <= 0 or hj <= 0:
+            return np.zeros((1, 1), dtype=cache['dtype'])
+        rps = conn.c.sf.createRawPixelsStore()
+        rps.setPixelsId(cache['pid'], False)
+        # setResolutionLevel(): 0 = smallest, n-1 = full res (reversed vs levels).
+        rps.setResolutionLevel((n - 1) - j)
+        buf = rps.getTile(0, channel_num, 0, xj, yj, wj, hj)
+        rps.close()
 
-        if src_w <= 0 or src_h <= 0:
-            return np.zeros((1, 1), dtype=np.uint16)
-
-        tile = cache['pixels'].getTile(0, channel_num, 0, (src_x, src_y, src_w, src_h))
-
-    # Downsample outside the lock (CPU work, no OMERO access needed)
-    if scale > 1:
-        pad_h = (scale - tile.shape[0] % scale) % scale
-        pad_w = (scale - tile.shape[1] % scale) % scale
-        if pad_h or pad_w:
-            tile = np.pad(tile, ((0, pad_h), (0, pad_w)), mode='constant')
-        tile = block_reduce(tile, (scale, scale), np.mean).astype(tile.dtype)
-
+    tile = np.frombuffer(buf, dtype=cache['dtype']).reshape(hj, wj)
+    if extra > 1:
+        tile = block_reduce(tile, (extra, extra), np.mean).astype(cache['dtype'])
     return tile
+
+
+def download_omero_annotation(ann_id, dest_path):
+    """Download an OMERO FileAnnotation's file content to dest_path.
+
+    Retries once if the Ice connection drops mid-transfer (large files can
+    outlast an idle/stale session); the retry forces a fresh reconnect.
+    """
+    global _omero_conn
+    last_exc = None
+    for attempt in range(2):
+        try:
+            with _omero_lock:
+                conn = _ensure_omero_connection()
+                ann = conn.getObject("FileAnnotation", int(ann_id))
+                if ann is None:
+                    raise ValueError(
+                        "OMERO FileAnnotation %s not found" % ann_id)
+                with open(dest_path, 'wb') as fh:
+                    for chunk in ann.getFileInChunks():
+                        fh.write(chunk)
+            return dest_path
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - connection loss etc.
+            last_exc = exc
+            with _omero_lock:
+                try:
+                    if _omero_conn is not None:
+                        _omero_conn.close()
+                except Exception:
+                    pass
+                _omero_conn = None
+                _omero_pixels_cache.clear()
+    raise last_exc
+
+
+def get_omero_channel_info(image_id, name_prefix='channel'):
+    """Return channel_info for an OMERO image for live-tile serving, mirroring
+    the dict convertOmeTiff() returns for a local channel file — but sourced
+    from OMERO metadata + OMERO's own resolution pyramid, so the (potentially
+    huge) image is never downloaded.
+
+    Keys: maxLevel, height, width, num_channels, tileHeight, tileWidth,
+          channel_names (src identifiers, '<prefix>_<i>'),
+          channel_labels (OMERO channel names for display/matching).
+    """
+    with _omero_lock:
+        conn = _ensure_omero_connection()
+        img = conn.getObject('Image', int(image_id))
+        if img is None:
+            raise ValueError("OMERO image %s not found" % image_id)
+        num_c = img.getSizeC()
+        h, w = img.getSizeY(), img.getSizeX()
+        labels = []
+        for i, ch in enumerate(img.getChannels()):
+            labels.append(ch.getLabel() or ('ch%d' % i))
+        rps = conn.c.sf.createRawPixelsStore()
+        rps.setPixelsId(img.getPrimaryPixels().getId(), False)
+        n_levels = len(rps.getResolutionDescriptions())
+        rps.close()
+    prefix = re.sub(r'[#\[\] ]+', '_', name_prefix)
+    prefix = re.sub(r'_+', '_', prefix).strip('_') or 'channel'
+    channel_names = ['%s_%d' % (prefix, i) for i in range(num_c)]
+    return {
+        'maxLevel': max(1, n_levels),
+        'height': int(h),
+        'width': int(w),
+        'num_channels': int(num_c),
+        'tileHeight': 1024,
+        'tileWidth': 1024,
+        'channel_names': channel_names,
+        'channel_labels': labels,
+    }
 
 
 def init(datasource_name):
@@ -133,8 +272,6 @@ def load_datasource(datasource_name, reload=False):
         if source is datasource_name and datasource is not None and reload is False:
             return
         load_config(datasource_name)
-        if reload:
-            load_ball_tree(datasource_name, reload=reload)
         csvPath = Path(config[datasource_name]['featureData'][0]['src'])
         print("Loading csv data.. (this can take some time)")
         datasource = pd.read_csv(csvPath)
@@ -164,19 +301,24 @@ def load_datasource(datasource_name, reload=False):
                 conn = _ensure_omero_connection()
                 omero_image = conn.getObject('Image', omero_image_id)
                 num_c = omero_image.getSizeC()
-                img_h = omero_image.getSizeY()
-                img_w = omero_image.getSizeX()
-                reduce_factor = max(1, max(img_h, img_w) // 200)
-                pixels = omero_image.getPrimaryPixels()
+                cache = _omero_pixel_cache(omero_image_id)
+                # Read the channel histogram / slider source from OMERO's
+                # COARSEST pyramid level (small), so a gigapixel whole slide is
+                # never fetched in one plane (which overflows OMERO's int32).
+                n = len(cache['levels'])
+                lw, lh = cache['levels'][n - 1]  # smallest level dims
+                rps = conn.c.sf.createRawPixelsStore()
+                rps.setPixelsId(cache['pid'], False)
+                rps.setResolutionLevel(0)        # 0 = smallest
                 planes = []
                 for c in range(num_c):
-                    plane = pixels.getTile(0, c, 0, (0, 0, img_w, img_h))
+                    buf = rps.getTile(0, c, 0, 0, 0, lw, lh)
+                    plane = np.frombuffer(buf, dtype=cache['dtype']).reshape(lh, lw)
                     if plane.dtype == np.uint8:
                         plane = plane.astype(np.uint16) * np.uint16(257)
-                    if reduce_factor > 1:
-                        plane = block_reduce(plane, (reduce_factor, reduce_factor), np.mean)
                     planes.append(plane)
-            zarray = np.stack(planes)  # CYX
+                rps.close()
+            zarray = np.stack(planes)  # CYX (coarse level)
             print(f"  OMERO histogram zarray: {zarray.shape}, dtype: {zarray.dtype}")
         else:
             # Local file mode (with or without OMERO tile serving).
@@ -220,6 +362,12 @@ def load_datasource(datasource_name, reload=False):
 
         # Set source LAST — after all globals are fully initialized.
         source = datasource_name
+        if reload:
+            # Rebuild the ball tree now that `source` is set. Doing this AFTER
+            # source is assigned makes load_ball_tree's `datasource != source`
+            # guard short-circuit instead of re-entering load_datasource, which
+            # would deadlock on the non-reentrant _load_lock we still hold here.
+            load_ball_tree(datasource_name, reload=reload)
         print("Data loading done.")
 
 
@@ -800,8 +948,13 @@ def get_datasource_description(datasource_name):
     for channel in list_channels:
         if channel['name'] != 'Area':
             fullName = channel['fullname']
-
             image_data = zarray[image_layer]
+            image_layer += 1
+            # Only channels that map to a CSV column get an image histogram.
+            # An image channel whose name isn't a CSV column (e.g. an OMERO
+            # channel label with no matching marker) is skipped, not crashed.
+            if fullName not in description:
+                continue
             img_log = np.log(image_data[image_data > 0])
             [hist, bin_edges] = np.histogram(img_log.flatten(), bins=50, density=True)
             midpoints = (bin_edges[1:] + bin_edges[:-1]) / 2
@@ -817,8 +970,6 @@ def get_datasource_description(datasource_name):
             description[fullName]['image_histogram'] = dat
             description[fullName]['image_min'] = np.ceil(np.exp(np.min(img_log)))
             description[fullName]['image_max'] = np.ceil(np.exp(np.max(img_log)))
-
-            image_layer += 1
         else:
             continue
 

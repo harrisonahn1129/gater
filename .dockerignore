@@ -1,0 +1,21 @@
+# Runtime data (multi-GB imagery) is provided via a mounted volume, never baked
+# into the image. This is the critical exclusion — without it the build context
+# is ~43 GB and COPY fails.
+minerva_analysis/data/
+
+# VCS, caches, local cruft
+.git/
+.gitignore
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.DS_Store
+**/.DS_Store
+
+# Node build deps (the built bundle in client/dist IS needed and kept)
+**/node_modules/
+
+# Local dev helpers (host-oriented; not used inside the image)
+run_local.sh
+smoke_base_path.sh

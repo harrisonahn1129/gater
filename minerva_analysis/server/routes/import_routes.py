@@ -545,6 +545,11 @@ def save_config():
             if 'channelFile' in originalData:
                 configData[datasetName]['channelFile'] = originalData['channelFile']
 
+            # OMERO live-tile datasource: the channel image stays in OMERO and is
+            # served from its own pyramid via omero_image_id (no local channelFile).
+            if 'omero_image_id' in originalData and originalData['omero_image_id']:
+                configData[datasetName]['omero_image_id'] = int(originalData['omero_image_id'])
+
             if 'activeChannel' in originalData:
                 configData[datasetName]['activeChannel'] = originalData['activeChannel']
 
@@ -756,4 +761,161 @@ def serialize_and_submit_json(data):
         mimetype='application/json'
     )
     return response
+
+
+@app.route('/open_from_omero', methods=['GET', 'POST'])
+def open_from_omero():
+    """Landing page for the OMERO.web "Open in Gater" hand-off.
+
+    Renders a lightweight progress page immediately; that page opens the shared
+    /progress SSE and fetches /open_from_omero_run (the slow download/convert),
+    then swaps in the config-check page when done. Reuses the same progress-bar
+    mechanism as the local upload flow instead of leaving the tab blank for the
+    couple of minutes the bridge takes.
+    """
+    global total_tasks, completed_task, current_task
+    src = request.values
+    datasetName = src.get('name')
+    omero_image_id = src.get('image_id') or src.get('omero_image_id')
+    quant_ann = src.get('quant')
+    seg_ann = src.get('seg')
+    missing = [k for k, v in (('name', datasetName), ('image_id', omero_image_id),
+                              ('quant', quant_ann), ('seg', seg_ann)) if not v]
+    if missing:
+        return "Missing required params: %s" % ", ".join(missing), 400
+    # Reset progress so the SSE starts at 0 (not a stale 100 from a prior run).
+    total_tasks, completed_task, current_task = 6, 0, "Starting"
+    return render_template('omero_loading.html', name=datasetName)
+
+
+@app.route('/open_from_omero_run', methods=['GET', 'POST'])
+def open_from_omero_run():
+    """Worker for the OMERO.web hand-off (see open_from_omero). Does the actual
+    download/convert while driving the total_tasks/completed_task/current_task
+    globals that the /progress SSE streams to the loading page.
+
+    Params (GET or POST): name, image_id, quant (FileAnnotation id),
+    seg (FileAnnotation id, a zipped .zarr). The image stays in OMERO and is
+    served live-tile via its own pyramid (omero_image_id); only the CSV and the
+    segmentation are downloaded, the seg becomes a pyramidal OME-TIFF, and the
+    config-check page (channel_match.html) is rendered — like a local upload.
+    """
+    global total_tasks, completed_task, current_task
+    import zipfile
+    import tifffile as tf
+    from minerva_analysis.server.utils.omero_zarr_to_ometiff import omero_zarr_to_ometiff
+
+    src = request.values
+    datasetName = src.get('name')
+    omero_image_id = src.get('image_id') or src.get('omero_image_id')
+    quant_ann = src.get('quant')
+    seg_ann = src.get('seg')
+    missing = [k for k, v in (('name', datasetName), ('image_id', omero_image_id),
+                              ('quant', quant_ann), ('seg', seg_ann)) if not v]
+    if missing:
+        return "Missing required params: %s" % ", ".join(missing), 400
+    total_tasks, completed_task, current_task = 6, 0, "Downloading quantification"
+
+    try:
+        file_path = Path(cwd_path, data_path, datasetName)
+        file_path.mkdir(parents=True, exist_ok=True)
+
+        # 1. Quantification CSV: download + (if OMERO-format) convert to mcmicro.
+        current_task = "Downloading quantification"
+        csvName = datasetName + '_quantification.csv'
+        serverCsvPath = str(file_path / csvName)
+        data_model.download_omero_annotation(quant_ann, serverCsvPath)
+        completed_task = 1
+        with open(serverCsvPath, 'r') as probe:
+            probe_header = csv.DictReader(probe).fieldnames
+        if is_omero_csv(probe_header):
+            current_task = "Converting quantification"
+            omero_csv_to_mcmicro(serverCsvPath)
+        with open(serverCsvPath, 'r') as infile:
+            csvHeader = csv.DictReader(infile).fieldnames
+        completed_task = 2
+
+        # 2. Segmentation: download zip -> unzip -> convert .zarr to pyramidal
+        #    OME-TIFF (Gater computes/stores the seg pyramid).
+        current_task = "Downloading segmentation"
+        seg_zip = str(file_path / 'segmentation.zip')
+        data_model.download_omero_annotation(seg_ann, seg_zip)
+        completed_task = 3
+        current_task = "Unzipping segmentation"
+        with zipfile.ZipFile(seg_zip) as zf:
+            zf.extractall(str(file_path))
+        zarr_dirs = [p for p in file_path.iterdir()
+                     if p.is_dir() and p.suffix == '.zarr']
+        if not zarr_dirs:
+            raise ValueError("No .zarr directory found in the segmentation zip")
+        seg_zarr = zarr_dirs[0]
+        seg_ometiff = file_path / (seg_zarr.stem + '.ome.tif')
+        completed_task = 4
+        current_task = "Building segmentation pyramid (this can take a while)"
+        if not seg_ometiff.exists():
+            omero_zarr_to_ometiff(seg_zarr, output_path=seg_ometiff)
+        labelName = seg_zarr.stem
+        seg_io = tf.TiffFile(str(seg_ometiff), is_ome=False)
+        seg_max = len(seg_io.series[0].levels)
+        seg_io.close()
+        completed_task = 5
+
+        # 3. Channel info from OMERO metadata (image served live-tile).
+        current_task = "Reading channel metadata"
+        channel_info = data_model.get_omero_channel_info(
+            omero_image_id, name_prefix=datasetName)
+        channelFileNames = ['ID', 'Area', 'X Position', 'Y Position']
+        channelFileNames.extend(channel_info['channel_names'])
+
+        # 4. Assemble the config-check payload (mirrors upload_file_page).
+        full_csv_header = [{'fullName': h} for h in csvHeader]
+        header_full_names = [e['fullName'] for e in full_csv_header]
+        config_data = {
+            'csvHeader': full_csv_header,
+            'substring': mostFrequentLongestSubstring.find_substring(header_full_names),
+            'datasetName': datasetName,
+            'maxLevel': max(channel_info['maxLevel'], seg_max),
+            'height': channel_info['height'],
+            'width': channel_info['width'],
+            'segmentation': str(seg_ometiff),
+            'num_channels': channel_info['num_channels'],
+            'tileHeight': channel_info['tileHeight'],
+            'tileWidth': channel_info['tileWidth'],
+            'channelFileNames': channelFileNames,
+            'csvName': csvName,
+            'channelFile': '',                      # live-tile: no local channel file
+            'omero_image_id': int(omero_image_id),
+            'new': True,
+            'labelName': labelName,
+            'datasources': get_config_names() + [datasetName],
+        }
+
+        listNotMarkers = [
+            'CellID', 'X_centroid', 'Y_centroid', 'Area', 'MajorAxisLength',
+            'MinorAxisLength', 'Eccentricity', 'Solidity', 'Extent',
+            'Orientation', 'column_centroid', 'row_centroid', 'phenotype',
+            'object', 'prob', 'geometry', 'centroid', 'Bbox_min_x',
+            'Bbox_min_y', 'Bbox_max_x', 'Bbox_max_y', 'tile_index',
+            'orig_object', 'Perimeter', 'Centroid_x', 'Centroid_y',
+            'Longest_axis', 'Convexity', 'Compactness_circle',
+            'Compactness_square', 'Area_convex', 'Min_rot_rect', 'Elongation',
+            'Major_axis', 'Minor_axis', 'Circular_diameter', 'Euler_number',
+        ]
+        try:
+            listImageData = [n for n in header_full_names if n not in listNotMarkers]
+            dImg = pd.read_csv(Path(serverCsvPath))[[*listImageData]]
+            config_data['isTransformed'] = bool(np.mean(np.mean(dImg)) < 15)
+        except Exception:
+            config_data['isTransformed'] = False
+
+        completed_task = 6
+        current_task = "Complete"
+        return render_template('channel_match.html', data=config_data)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        # Signal the loading page's /progress SSE to show the error state.
+        completed_task = -1
+        current_task = str(e)
+        return "Failed to open from OMERO: %s" % e, 500
 

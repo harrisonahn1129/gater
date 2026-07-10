@@ -74,7 +74,7 @@ class ImageViewer {
         // Config viewer
         const viewer_config = {
             id: "openseadragon",
-            prefixUrl: "/client/external/openseadragon-bin-2.4.0/openseadragon-flat-toolbar-icons-master/images/",
+            prefixUrl: (window.GATER_BASE_PATH || "") + "/client/external/openseadragon-bin-2.4.0/openseadragon-flat-toolbar-icons-master/images/",
             minZoomImageRatio: 0.1,
             maxZoomPixelRatio: 15,
             compositeOperation: "lighter",
@@ -166,8 +166,8 @@ class ImageViewer {
             return gl.canvas;
         };
 
-        seaGL.vShader = "/client/src/shaders/vert.glsl";
-        seaGL.fShader = "/client/src/shaders/frag.glsl";
+        seaGL.vShader = (window.GATER_BASE_PATH || "") + "/client/src/shaders/vert.glsl";
+        seaGL.fShader = (window.GATER_BASE_PATH || "") + "/client/src/shaders/frag.glsl";
 
         // Overwrite tile-drawing method
         seaGL.io["tile-drawing"] = function (e) {

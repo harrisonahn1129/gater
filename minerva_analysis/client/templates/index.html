@@ -1,8 +1,8 @@
 {% extends 'base.html' %}
 
 {% block style %}
-<link rel="stylesheet" href="../client/src/css/viewer.css">
-<link rel="stylesheet" href="../client/src/css/gating.css">
+<link rel="stylesheet" href="{{ base_path }}/client/src/css/viewer.css">
+<link rel="stylesheet" href="{{ base_path }}/client/src/css/gating.css">
 {% endblock %}
 
 {% block content %}
@@ -130,6 +130,6 @@
         </div>
     </div>
 </div>
-<script src="../client/src/js/main.js" defer></script>
+<script src="{{ base_path }}/client/src/js/main.js" defer></script>
 {% endif %}
 {% endblock %}

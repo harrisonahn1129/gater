@@ -1,0 +1,78 @@
+<!doctype html>
+<head>
+    <meta charset="utf-8">
+    <title>Opening in Gater…</title>
+    <script>window.GATER_BASE_PATH = "{{ base_path }}";</script>
+    <style>
+        body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+               background: #1b1b1b; color: #eee; margin: 0; }
+        .omero-loading { max-width: 560px; margin: 18vh auto 0; padding: 0 24px; text-align: center; }
+        .omero-loading h2 { font-weight: 500; font-size: 20px; margin-bottom: 6px; }
+        .omero-loading .sub { color: #9aa0a6; font-size: 13px; margin-bottom: 28px; }
+        .bar-outer { background: #333; border-radius: 6px; height: 14px; overflow: hidden; }
+        .bar-inner { background: linear-gradient(90deg, #2e7d32, #43a047); height: 100%;
+                     width: 0%; transition: width .4s ease; }
+        .row2 { display: flex; justify-content: space-between; margin-top: 10px;
+                font-size: 13px; color: #cfcfcf; }
+        #err { display: none; margin-top: 22px; color: #ef5350; font-size: 13px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+<div class="omero-loading">
+    <h2>Preparing “{{ name }}” for Gater</h2>
+    <div class="sub">Downloading and converting the segmentation &amp; quantification from OMERO. This can take a couple of minutes.</div>
+    <div class="bar-outer"><div id="bar" class="bar-inner"></div></div>
+    <div class="row2"><span id="task">Starting…</span><span id="pct">0%</span></div>
+    <div id="err"></div>
+</div>
+<script>
+    (function () {
+        var base = window.GATER_BASE_PATH || "";
+        var qs = window.location.search;              // forward the same name/image_id/quant/seg
+        var barEl = document.getElementById('bar');
+        var pctEl = document.getElementById('pct');
+        var taskEl = document.getElementById('task');
+        var errEl = document.getElementById('err');
+
+        // Server processing progress (shared /progress SSE used by the upload flow).
+        var src = new EventSource(base + "/progress");
+        src.onmessage = function (event) {
+            var d = JSON.parse(event.data);
+            if (d.percentage < 0) {
+                taskEl.textContent = d.currentTask || 'Error';
+                return;
+            }
+            barEl.style.width = d.percentage + '%';
+            pctEl.textContent = d.percentage + '%';
+            if (d.currentTask) taskEl.textContent = d.currentTask;
+        };
+        src.onerror = function () { /* SSE auto-reconnects; ignore transient drops */ };
+
+        // Kick off the actual download/convert; it drives the globals above.
+        fetch(base + "/open_from_omero_run" + qs)
+            .then(function (r) { return r.text().then(function (html) { return { ok: r.ok, html: html }; }); })
+            .then(function (res) {
+                src.close();
+                if (!res.ok) {
+                    errEl.style.display = 'block';
+                    errEl.textContent = res.html || 'Failed to open from OMERO.';
+                    taskEl.textContent = 'Failed';
+                    return;
+                }
+                // Swap in the config-check page (same pattern the upload flow uses).
+                barEl.style.width = '100%';
+                pctEl.textContent = '100%';
+                document.open();
+                document.write(res.html);
+                document.close();
+            })
+            .catch(function (err) {
+                src.close();
+                errEl.style.display = 'block';
+                errEl.textContent = 'Failed: ' + err;
+                taskEl.textContent = 'Failed';
+            });
+    })();
+</script>
+</body>
+</html>

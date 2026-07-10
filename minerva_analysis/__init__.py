@@ -46,6 +46,50 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + str(data_path) + '/db.sql
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['CLIENT_PATH'] = app.root_path + '/client/'
 config_json_path = data_path / "config.json"
+
+
+# --- Base-path support (serving under a URL prefix, e.g. /user/<name>) --------
+# When Gater runs behind a path-based proxy (the per-user Ingress created by the
+# spawner passes /user/<name>/... through unchanged), GATER_BASE_PATH is set to
+# that prefix. We (a) strip it from inbound requests so Flask routes still match,
+# and (b) expose it to templates/JS so generated URLs include it. Empty by
+# default -> served at the root, unchanged behaviour.
+def _normalize_base_path(raw):
+    raw = (raw or '').strip().rstrip('/')
+    if raw and not raw.startswith('/'):
+        raw = '/' + raw
+    return raw
+
+
+app.config['BASE_PATH'] = _normalize_base_path(os.environ.get('GATER_BASE_PATH'))
+
+
+class PrefixMiddleware:
+    """Strip BASE_PATH from PATH_INFO (into SCRIPT_NAME) so routes defined at
+    '/' match when served behind a path-based proxy."""
+
+    def __init__(self, wsgi_app, prefix=''):
+        self.wsgi_app = wsgi_app
+        self.prefix = prefix
+
+    def __call__(self, environ, start_response):
+        path = environ.get('PATH_INFO', '')
+        if path == self.prefix or path.startswith(self.prefix + '/'):
+            environ['PATH_INFO'] = path[len(self.prefix):] or '/'
+            environ['SCRIPT_NAME'] = self.prefix
+        return self.wsgi_app(environ, start_response)
+
+
+if app.config['BASE_PATH']:
+    app.wsgi_app = PrefixMiddleware(app.wsgi_app, app.config['BASE_PATH'])
+
+
+@app.context_processor
+def _inject_base_path():
+    # Makes {{ base_path }} available in every template.
+    return {'base_path': app.config['BASE_PATH']}
+
+
 db = SQLAlchemy(app)
 
 

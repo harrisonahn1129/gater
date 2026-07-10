@@ -27,6 +27,20 @@ RUN python -m pip install \
     appdirs \
     xmlschema
 
+# --- OMERO Python bindings (omero-py) ---
+# data_model.py streams tiles live from OMERO via BlitzGateway, which requires
+# omero-py + Zeroc Ice 3.6. Ice 3.6 has no official PyPI wheel and is painful to
+# build from source, so use Glencoe Software's prebuilt Ice wheel.
+#
+# NOTE: this wheel is linux/amd64 + CPython 3.9 specific (matches this base
+# image and the NYU cluster nodes; build with --platform=linux/amd64 on Apple
+# Silicon). For a different platform/Python, pick the matching wheel from:
+#   https://github.com/glencoesoftware/zeroc-ice-py-linux-x86_64/releases
+# and verify the tag/filename below is still current.
+RUN python -m pip install \
+    https://github.com/glencoesoftware/zeroc-ice-py-linux-x86_64/releases/download/20240202/zeroc_ice-3.6.5-cp39-cp39-manylinux_2_28_x86_64.whl \
+    && python -m pip install omero-py
+
 COPY . /app
 
 CMD ["python", "/app/run.py"]
