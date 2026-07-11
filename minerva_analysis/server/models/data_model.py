@@ -43,9 +43,54 @@ _omero_lock = threading.Lock()  # Serialize OMERO access (BlitzGateway is not th
 
 # --- OMERO integration ---
 _omero_conn = None
-_omero_pixels_cache = {}  # image_id -> PrimaryPixels object
+_omero_pixels_cache = {}  # image_id -> {pid, dtype, levels}
+_omero_rps_cache = {}     # image_id -> reusable RawPixelsStore (per connection)
 _omero_last_used = 0.0    # monotonic-ish time of last connection use
 _OMERO_IDLE_TIMEOUT = 45  # seconds; reconnect fresh after this much idle
+
+# --- Live-tile LRU cache ---
+# Caches the final per-(image, channel, level, tile) numpy array so repeated
+# requests (panning back, toggling a channel on/off, re-rendering) never touch
+# OMERO. Guarded by its OWN lock (not _omero_lock), so cache hits are fully
+# concurrent across server threads instead of serializing behind OMERO.
+from collections import OrderedDict as _OrderedDict
+_tile_cache = _OrderedDict()
+_tile_cache_lock = threading.Lock()
+# ~2 MB per uint16 1024x1024 tile; 256 -> ~0.5 GB ceiling. Env-overridable.
+_TILE_CACHE_MAX = max(0, int(os.environ.get('GATER_TILE_CACHE_SIZE', '256')))
+
+
+def _tile_cache_get(key):
+    with _tile_cache_lock:
+        val = _tile_cache.get(key)
+        if val is not None:
+            _tile_cache.move_to_end(key)
+        return val
+
+
+def _tile_cache_put(key, val):
+    if _TILE_CACHE_MAX <= 0:
+        return
+    with _tile_cache_lock:
+        _tile_cache[key] = val
+        _tile_cache.move_to_end(key)
+        while len(_tile_cache) > _TILE_CACHE_MAX:
+            _tile_cache.popitem(last=False)
+
+
+def _clear_omero_caches():
+    """Close and drop cached RawPixelsStores + pixel metadata. Call whenever the
+    OMERO connection is (re)dropped — the stores are bound to the OMERO session
+    and become invalid across a reconnect. (The tile cache is NOT cleared: tiles
+    are keyed by image content, which does not change across reconnects.)
+    Must be called while holding _omero_lock."""
+    for rps in _omero_rps_cache.values():
+        try:
+            rps.close()
+        except Exception:
+            pass
+    _omero_rps_cache.clear()
+    _omero_pixels_cache.clear()
 
 
 def _ensure_omero_connection():
@@ -69,7 +114,7 @@ def _ensure_omero_connection():
         except Exception:
             pass
         _omero_conn = None
-        _omero_pixels_cache.clear()
+        _clear_omero_caches()
 
     from omero.gateway import BlitzGateway
     # Host/port/credentials are env-configurable so the containerized app can
@@ -118,6 +163,22 @@ def _omero_pixel_cache(image_id):
     return cache
 
 
+def _get_rps(image_id):
+    """Return a reusable RawPixelsStore for image_id, created once per
+    connection. Reusing the store avoids ~35 ms/tile of createRawPixelsStore +
+    setPixelsId overhead (measured ~45 ms -> ~11 ms per tile). Cleared on
+    reconnect via _clear_omero_caches(). Must be called while holding
+    _omero_lock (the store is stateful: setResolutionLevel is set per tile)."""
+    rps = _omero_rps_cache.get(image_id)
+    if rps is None:
+        conn = _ensure_omero_connection()
+        cache = _omero_pixel_cache(image_id)
+        rps = conn.c.sf.createRawPixelsStore()
+        rps.setPixelsId(cache['pid'], False)
+        _omero_rps_cache[image_id] = rps
+    return rps
+
+
 def _get_omero_tile(image_id, channel_num, x, y, w, h, level=0):
     """Fetch a single-channel 2D tile from OMERO for the client's UNIFORM
     power-of-2 pyramid.
@@ -136,9 +197,17 @@ def _get_omero_tile(image_id, channel_num, x, y, w, h, level=0):
     uniform pyramid the client and segmentation share, keeping channel tiles
     aligned with the segmentation at every zoom -- and still size-safe on
     gigapixel slides (a level-k tile only ever reads ~w*h pixels off OMERO).
+
+    Results go through an LRU cache keyed by the exact request, so re-rendering
+    the same tile (channel toggle, pan back, redraw) is served from memory
+    without touching OMERO or the OMERO lock.
     """
+    key = (image_id, channel_num, level, x, y, w, h)
+    cached = _tile_cache_get(key)
+    if cached is not None:
+        return cached
+
     with _omero_lock:
-        conn = _ensure_omero_connection()
         cache = _omero_pixel_cache(image_id)
         levels = cache['levels']
         n = len(levels)
@@ -165,16 +234,16 @@ def _get_omero_tile(image_id, channel_num, x, y, w, h, level=0):
         hj = min(int(round(h * target_ds / ds[j])), lh - yj)
         if wj <= 0 or hj <= 0:
             return np.zeros((1, 1), dtype=cache['dtype'])
-        rps = conn.c.sf.createRawPixelsStore()
-        rps.setPixelsId(cache['pid'], False)
+        # Reuse the per-image pixel store instead of recreating it per tile.
+        rps = _get_rps(image_id)
         # setResolutionLevel(): 0 = smallest, n-1 = full res (reversed vs levels).
         rps.setResolutionLevel((n - 1) - j)
         buf = rps.getTile(0, channel_num, 0, xj, yj, wj, hj)
-        rps.close()
 
     tile = np.frombuffer(buf, dtype=cache['dtype']).reshape(hj, wj)
     if extra > 1:
         tile = block_reduce(tile, (extra, extra), np.mean).astype(cache['dtype'])
+    _tile_cache_put(key, tile)
     return tile
 
 
@@ -209,7 +278,7 @@ def download_omero_annotation(ann_id, dest_path):
                 except Exception:
                     pass
                 _omero_conn = None
-                _omero_pixels_cache.clear()
+                _clear_omero_caches()
     raise last_exc
 
 

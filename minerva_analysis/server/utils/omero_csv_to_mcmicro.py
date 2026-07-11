@@ -18,6 +18,7 @@ works without modification.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -109,10 +110,10 @@ def omero_csv_to_mcmicro(input_path, output_path=None):
     else:
         output_path = Path(output_path)
 
-    df = pd.read_csv(input_path)
-
-    # Discover channel names from header
-    channels = discover_channels(list(df.columns))
+    # Discover channel names from the header only — avoids loading the
+    # (possibly multi-GB) file into memory just to read column names.
+    header_cols = list(pd.read_csv(input_path, nrows=0).columns)
+    channels = discover_channels(header_cols)
     if not channels:
         raise ValueError(
             f"No *_Mean_intensity columns found in {input_path}. "
@@ -131,22 +132,29 @@ def omero_csv_to_mcmicro(input_path, output_path=None):
     # Morphology columns
     rename.update(_MORPHOLOGY_RENAME)
 
-    df = df.rename(columns=rename)
-
-    # Build output column order
+    # Build output column order (names after renaming)
+    renamed_header = [rename.get(c, c) for c in header_cols]
     out_cols = ['CellID', 'X_centroid', 'Y_centroid']
     out_cols.extend(channels)
-    morph_cols = list(_MORPHOLOGY_RENAME.values())
-    for col in morph_cols:
-        if col in df.columns:
+    for col in _MORPHOLOGY_RENAME.values():
+        if col in renamed_header:
             out_cols.append(col)
 
-    # Select only the columns we want (drops all others)
-    df = df[out_cols]
-
-    df.to_csv(output_path, index=False)
-
-    num_rows = len(df)
+    # Stream the file in chunks so peak memory stays bounded. OMERO quant CSVs
+    # can be well over 1 GB and a single pd.read_csv expands to several GB in
+    # RAM, OOM-killing the container. Write to a temp file first because
+    # output_path may equal input_path (in-place conversion).
+    tmp_out = output_path.with_name(output_path.name + '.tmp')
+    num_rows = 0
+    wrote_header = False
+    for chunk in pd.read_csv(input_path, chunksize=100_000):
+        chunk = chunk.rename(columns=rename)[out_cols]
+        chunk.to_csv(tmp_out, index=False,
+                     header=not wrote_header,
+                     mode='w' if not wrote_header else 'a')
+        wrote_header = True
+        num_rows += len(chunk)
+    os.replace(tmp_out, output_path)
     print(
         f"Converted OMERO CSV -> mcmicro: {len(channels)} channels, "
         f"{num_rows} cells, {len(out_cols)} columns\n"

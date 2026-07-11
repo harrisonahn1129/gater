@@ -903,7 +903,11 @@ def open_from_omero_run():
         ]
         try:
             listImageData = [n for n in header_full_names if n not in listNotMarkers]
-            dImg = pd.read_csv(Path(serverCsvPath))[[*listImageData]]
+            # Sample only the first rows — the mean is just a heuristic for
+            # whether the data is already log-transformed, and the full CSV can
+            # be millions of rows (loading it all OOM-kills the container).
+            dImg = pd.read_csv(Path(serverCsvPath), usecols=listImageData,
+                               nrows=200000)
             config_data['isTransformed'] = bool(np.mean(np.mean(dImg)) < 15)
         except Exception:
             config_data['isTransformed'] = False
