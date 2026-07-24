@@ -455,7 +455,7 @@ class CSVGatingList {
 
         gating_download_icon_db.addEventListener('click', () => {
             this.dataLayer.saveGatingList(this.gating_channels, this.selections, this.seaDragonViewer.list_lassos);
-            alert("Saved Gating to Database");
+            alert("Saved Gating to OMERO");
         })
 
         // Open / close download panel

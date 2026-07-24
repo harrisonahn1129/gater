@@ -180,6 +180,7 @@ Get this answer first.
 - Base-path/URL-prefix breakage under per-user path routing = classic blank-page cause — test early.
 - HIPAA/PHI could reshape the whole design — surface before building.
 - NYU IT approval latency (OIDC client / Ingress hostname / RBAC) can be the long pole — request immediately.
+- **Slow datasource switch (known perf issue, flagged 2026-07-23).** Selecting a previously-uploaded datasource from the Data Sources menu is slow. It is **not** a re-import from OMERO — the menu links to the plain viewer route `/<datasource>`, which calls `load_datasource()` (`data_model.py`), not `open_from_omero_run()`. Two causes: (1) **Pre-existing:** Gater holds only ONE datasource in memory (module-level globals), so every switch does a full from-scratch reload — dominated by `pd.read_csv()` of the whole quantification CSV (~100 MB for the kidney set → seconds–tens of seconds), plus ball-tree load and a coarse-plane OMERO read. (2) **Added by the OMERO render-storage work:** `get_saved_channel_list` / `get_saved_gating_list` now hit OMERO first on load (two annotation round-trips, each possibly forcing a reconnect, plus a seeding write if absent), where they previously read only local SQLite. **Levers when addressed:** cache `get_omero_json` per `(image_id, kind)` + keep seeding off the load critical path (undoes the added cost); and an LRU of the last N datasources' DataFrame+ball_tree, or a parquet/feather sidecar for faster reload than `read_csv` (tackles the pre-existing cost). Matters more per-pod where cold loads are frequent.
 
 ---
 

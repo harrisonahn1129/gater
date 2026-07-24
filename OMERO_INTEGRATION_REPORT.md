@@ -267,3 +267,20 @@ Detection: `tifffile.TiffFile(path).series[0].axes` returns the axes string. Sto
 - **Pyramidal output for QPTIFF**: Currently writes a single-resolution tiled BigTIFF. Adding pyramid levels would improve viewer performance for very large images.
 - **Additional OMERO CSV statistics**: Currently only Mean intensity is preserved. If P75 or other percentiles are useful for gating, the converter could be extended to keep additional columns.
 - **The second QPTIFF** (`20230504-228B-custom_Scan1.qptiff`, 28 channels, 42.68 GB) has not been end-to-end tested through the upload flow yet.
+
+---
+
+## 11. Commit Log
+
+Chronological log of tagged commits on `feature/omero_gater_deployment` (newest appended at the bottom). Each entry lists the tag and what it implemented.
+
+### (baseline) `451660b` — Fix OMERO quant-CSV OOM and speed up live-tile serving (cache + store reuse)
+Prior committed state: live-tile LRU cache, reusable `RawPixelsStore`, quant-CSV OOM fix.
+
+### `v1.35_gater` — OMERO-side render/config storage, tile-OOM bound, restore-on-reopen, OMERO UI labels
+- **Live-tile OOM fix (Fix a)** — `_get_omero_tile` now reads the residual region in **extra-aligned sub-blocks** (new `_OMERO_MAX_RAW_TILE`, default 2048, env `GATER_OMERO_MAX_RAW_TILE`) instead of one unbounded `getTile`. Output is bit-identical to the old single read, but peak memory is ~step² pixels/tile regardless of zoom — fixes the tonsil zoom OOM-kill (exit 137) with seg + channel on.
+- **OMERO-side render/config storage** — a datasource's render state (channel colors/ranges, gating thresholds/lassos) and its config entry are mirrored to the OMERO image as **JSON FileAnnotations** (namespaces `gater.vida.nyu/render-state/{channel_list,gating_list}`, `gater.vida.nyu/config`). New helpers `put_omero_json` / `get_omero_json` (best-effort, reconnect-retry, **replace-by-namespace** so saves never accumulate duplicates) and `_jsonable` (strict-JSON: numpy→native, NaN→null). Dual-write on save (`save_channel_list`, `save_gating_list`); **OMERO-primary reads** with local-SQLite fallback + seed-on-load (`get_saved_channel_list`, `get_saved_gating_list`); config entry pushed in `save_config`.
+- **Restore-on-reopen** — `open_from_omero_run` reads back `gater_config.json`; `_restore_config_entry` re-points env-specific paths (CSV, segmentation, tile routes) at the current host's files and **skips the channel-match wizard**, redirecting straight to the viewer via new template `omero_restore_redirect.html`. Render state then restores via the OMERO-primary reads. (Limitation: phenotype/cluster data not restored — not re-downloaded.)
+- **UI relabels** — Channels + CSV Gating "Load/Save … Database" buttons and their save alerts now read "OMERO".
+- **Docs** — `DEPLOYMENT_PLAN.md` §9 flags the slow datasource-switch (single-slot globals → full-CSV reload, plus the OMERO annotation round-trips this work added).
+- **Files:** `data_model.py`, `import_routes.py`, `client/templates/omero_restore_redirect.html` (new), `client/templates/index.html`, `client/src/js/views/csvGatingList.js`, `client/src/js/views/channelList.js`, `DEPLOYMENT_PLAN.md`, `OMERO_INTEGRATION_REPORT.md`.

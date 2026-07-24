@@ -372,7 +372,7 @@ class ChannelList {
                 this.rangeConnector,
                 this.image_channels
             );
-            alert("Saved Channels from Database");
+            alert("Saved Channels to OMERO");
         });
     }
 

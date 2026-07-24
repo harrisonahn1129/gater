@@ -593,6 +593,13 @@ def save_config():
             json.dump(configData, configJson, indent=4)
             configJson.truncate()
             data_model.load_datasource(datasetName, reload=True)
+            # Mirror the finalized config entry to OMERO (best-effort backup /
+            # portability). Local config.json stays the bootstrap loader, since
+            # it is also the index that maps datasource -> omero_image_id.
+            if configData[datasetName].get('omero_image_id'):
+                data_model.put_omero_json(
+                    configData[datasetName]['omero_image_id'], 'config',
+                    configData[datasetName])
             resp = jsonify(success=True)
             return resp
 
@@ -763,6 +770,53 @@ def serialize_and_submit_json(data):
     return response
 
 
+def _restore_config_entry(stored_config, dataset_name, csv_path, seg_path,
+                          omero_image_id):
+    """Rebuild a datasource config entry from a saved gater_config.json pulled
+    back off the OMERO image, re-pointing the environment-specific fields at
+    THIS host's freshly-downloaded files. Lets the re-open flow skip the
+    channel-match wizard and land straight in the viewer with the exact prior
+    channel mapping / settings.
+
+    Returns the entry dict, or None if the stored config is missing/malformed
+    (the caller then falls back to the wizard).
+
+    Note: phenotype (celltype) and cluster data are NOT restored -- the re-open
+    flow only re-downloads the quantification CSV and segmentation, so any
+    references to those local-only files are dropped to avoid a load failure.
+    """
+    try:
+        if not stored_config or 'featureData' not in stored_config \
+                or not stored_config.get('featureData') \
+                or not stored_config.get('imageData'):
+            return None
+        entry = stored_config  # get_omero_json returns a fresh parsed object
+        # Environment-specific paths -> this host's freshly-downloaded files.
+        entry['featureData'][0]['src'] = str(csv_path)
+        entry['segmentation'] = str(seg_path)
+        entry['omero_image_id'] = int(omero_image_id)
+        entry['channelFile'] = ''            # live-tile datasource, no local file
+        # Drop refs to local-only artifacts we did not re-download, so
+        # load_datasource never points at a missing file.
+        entry['featureData'][0].pop('celltypeData', None)
+        entry['featureData'][0].pop('celltype', None)
+        entry.pop('clusterData', None)
+        # Tile-route srcs are keyed by datasource name; re-point them at this
+        # name in case the image was re-opened under a different dataset name.
+        for ch in entry['imageData']:
+            src = ch.get('src', '')
+            if src.startswith('/generated/data/'):
+                parts = src.split('/')   # ['', 'generated', 'data', <name>, ...]
+                if len(parts) >= 4:
+                    parts[3] = dataset_name
+                    ch['src'] = '/'.join(parts)
+        return entry
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 @app.route('/open_from_omero', methods=['GET', 'POST'])
 def open_from_omero():
     """Landing page for the OMERO.web "Open in Gater" hand-off.
@@ -859,6 +913,31 @@ def open_from_omero_run():
         seg_max = len(seg_io.series[0].levels)
         seg_io.close()
         completed_task = 5
+
+        # 2.5 Fast restore: if this image already carries a saved Gater config
+        #     (gater_config.json), reuse that exact datasource entry instead of
+        #     re-deriving it through the channel-match wizard. Re-point the
+        #     env-specific paths at the files we just downloaded, register it,
+        #     and jump straight into the viewer. Render state (colors/gates) then
+        #     comes back on its own via the OMERO-primary get_saved_* reads.
+        current_task = "Checking for saved configuration"
+        stored_config = data_model.get_omero_json(omero_image_id, 'config')
+        restored = _restore_config_entry(
+            stored_config, datasetName, serverCsvPath, str(seg_ometiff),
+            int(omero_image_id))
+        if restored is not None:
+            current_task = "Restoring saved configuration"
+            with open(config_json_path, "r+") as configJson:
+                cfg = json.load(configJson)
+                cfg[datasetName] = restored
+                configJson.seek(0)
+                json.dump(cfg, configJson, indent=4)
+                configJson.truncate()
+            data_model.load_datasource(datasetName, reload=True)
+            completed_task = 6
+            current_task = "Complete"
+            return render_template('omero_restore_redirect.html',
+                                   datasource=datasetName)
 
         # 3. Channel info from OMERO metadata (image served live-tile).
         current_task = "Reading channel metadata"
