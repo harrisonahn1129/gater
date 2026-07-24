@@ -286,3 +286,76 @@ Select image in OMERO.web → right_plugin shows "Open in Gater" (image_id known
 25. Confirm OMERO version ≥ 5.6 (required for the app/plugin mechanism).
 26. Any reverse-proxy/CSP that would block the redirect from OMERO.web's domain to gater.nyu.edu
     (cross-origin/cookie considerations)?
+
+---
+
+## 11. OMERO-side render/config storage & session restore — progress (2026-07-24)
+
+Goal: make **OMERO the source of truth** for a datasource's render/config so a per-user pod
+can be stateless and a researcher's saved session restores on any host. Foundational for the
+Phase 2 per-user-pod model (§1, §5). Fine-grained per-commit detail lives in
+`OMERO_INTEGRATION_REPORT.md` §11 (Commit Log).
+
+### 11.1 What was built
+
+- **Storage model — JSON FileAnnotations keyed by `(image, kind, dataset_name)`.** A datasource's
+  config entry **and** render state (channel colors/ranges, gating thresholds/lassos) are mirrored
+  to the OMERO Image as JSON FileAnnotations under stable namespaces
+  (`gater.vida.nyu/config`, `.../render-state/channel_list`, `.../render-state/gating_list`).
+  The namespace is stable per *kind* (so discovery is one indexed namespace query); the annotation
+  **description** carries the exact dataset name. A re-save of the same name replaces only its own
+  annotation, while **different names on the same image coexist** (upload the same image under
+  multiple names, each its own datasource). Helpers in `data_model.py`: `put_omero_json` /
+  `get_omero_json` / `list_omero_config_names` / `inherit_render_state` (best-effort, reconnect-retry).
+- **Dual-write, OMERO-primary.** Saves write both local SQLite (fallback) and OMERO; reads try
+  OMERO first then fall back to SQLite; seed-on-load copies local→OMERO when absent. Local
+  `config.json` stays the bootstrap loader (it is also the datasource→`omero_image_id` index).
+- **Session restore.** Opening a saved config reconstructs the datasource from `gater_config.json`
+  (`_restore_config_entry` re-points env paths), **skips the channel-match wizard**, and lands in
+  the viewer; **auto-restore-on-open** (`main.js`) then applies the saved channel/gating render state.
+- **Selection UIs.** (a) OMERO.web-side: the "Open in Gater" tab lists saved configs for the image
+  ("Open" dropdown → New / restore a saved name → Gater skips the wizard). (b) Gater-side wizard
+  "Start from" dropdown seeds a new datasource's render state from a prior config on the same image
+  (secondary fallback). (c) Panel buttons/labels relabeled Database→OMERO.
+
+### 11.2 Version state
+- **Committed baseline `v1.35_gater`:** Fix-(a) tile-OOM bound, initial render/config storage,
+  restore-on-reopen, UI relabels.
+- **Uncommitted (working, manually verified 2026-07-24), to commit as ~`v1.36_gater`:**
+  `(image, name)` re-keying; wizard "Start from" dropdown; OMERO.web "Open" selector (omero-gater
+  plugin); auto-restore-on-open; idempotent `applyChannels` rewrite (range + toggle/flash fixed).
+
+### 11.3 Follow-up flags — OPEN items to address later
+
+- **FLAG 1 — Channel COLOR not restored (deprioritized; "OK for now").** Restore brings back channel
+  active-state + intensity ranges + gating correctly, but channel **color stays default (white)**.
+  Not fully root-caused: `viewerManager.channel_add` reads `colorConnector[idx].color` and
+  `imageViewer.updateChannelColors` only applies to an already-active channel — both expect a
+  `d3.rgb`; fixed the connector format + fire-after-activation but color still doesn't land. Likely
+  how the WebGL shader consumes the color, or the event still not landing. (`channelList.js`
+  `applyChannels`; `imageViewer.updateChannelColors`; `viewerManager.channel_add`.)
+- **FLAG 2 — "Load Gating from OMERO" makes the segmentation mask vanish.** Gate *values* stay
+  correct on re-apply, but the seg-mask overlay disappears when the seg tab is open — a WebGL render
+  desync (`imageViewer.js` `bindGatings` / `show_subset`). Need to know how the seg mask is toggled
+  (channel panel vs gating overlay vs separate control) to fix.
+- **FLAG 3 — Slow datasource switch (also §9).** Full-CSV reload from single-slot module globals +
+  the OMERO annotation round-trips this work added. Levers: cache `get_omero_json` per `(image,kind)`
+  + keep seeding off the load hot path; LRU of last-N datasources or a parquet/feather sidecar for
+  faster reload than `read_csv`.
+- **FLAG 4 — config.json paths are local/container-absolute.** In deployment they should point to
+  **OMERO paths**. `_restore_config_entry` is the seam that re-points them (today → local downloaded
+  files).
+- **FLAG 5 — No-local-persist / live-stream quant+seg (stateless pod goal).** Quant CSV +
+  segmentation are still downloaded and converted to disk in `open_from_omero_run` (segmentation must
+  be a local pyramidal OME-TIFF for seg-tile serving). **Key experiment:** can OMERO serve the
+  segmentation as a tileable pyramid (`RawPixelsStore`) like the channel image, so it is never
+  downloaded? Quant CSV could be read on-demand into memory (ball tree is already an in-memory global).
+- **FLAG 6 — Restore drops phenotype (celltype) + cluster data.** `_restore_config_entry` drops
+  `celltypeData`/`celltype`/`clusterData` because re-open only re-downloads quant+seg. Extend to
+  re-download those annotations when present.
+- **FLAG 7 — Annotation ownership = env creds (root).** Writes use `OMERO_USER`/`OMERO_PASSWORD`
+  (root/omero). For real per-user discovery/ownership, revisit under the per-user `joinSession` auth
+  (§10.4); the discovery query should filter by owner/group so a user sees only their own datasources.
+- **FLAG 8 — Legacy image-keyed annotations.** Annotations saved before the `(image, name)` re-keying
+  have no description → don't match named reads; superseded on the next save. Any pre-re-keying test
+  annotations should be re-saved to migrate cleanly.

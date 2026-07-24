@@ -357,15 +357,34 @@ def _omero_image_id_for(datasource_name):
         return None
 
 
-def put_omero_json(image_id, kind, obj):
-    """Store obj as a JSON FileAnnotation (namespace _GATER_NS[kind]) on the
-    OMERO Image, replacing any prior Gater annotation of that namespace. The
-    new annotation is created BEFORE the old ones are removed, so data is never
-    lost if the delete fails (readers pick the newest). Best-effort: returns
-    True on success, False on any failure -- never raises."""
+def _gater_ann_name_of(ann):
+    """The dataset name a Gater annotation is scoped to = its OMERO description.
+    Legacy image-keyed annotations (written before (image, name) re-keying) have
+    no description; treat that as the empty string."""
+    try:
+        return ann.getDescription() or ''
+    except Exception:
+        return ''
+
+
+def put_omero_json(image_id, kind, dataset_name, obj):
+    """Store obj as a JSON FileAnnotation on the OMERO Image, scoped to
+    (image, kind, dataset_name).
+
+    Identity model: the namespace (_GATER_NS[kind]) stays stable per kind -- so
+    discovery can find every Gater datasource on an image with one namespace
+    query -- while the annotation's DESCRIPTION carries the exact dataset_name.
+    A re-save of the SAME name replaces only its own annotation (and sweeps any
+    legacy nameless one from before re-keying); DIFFERENT names on the same
+    image coexist. The new annotation is created BEFORE the old ones are
+    removed, so data is never lost if the delete fails (readers pick the
+    newest). Best-effort: returns True on success, False on any failure.
+    """
     global _omero_conn
     ns = _GATER_NS[kind]
-    filename = 'gater_%s.json' % kind
+    name = str(dataset_name)
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', name).strip('_') or 'unnamed'
+    filename = 'gater_%s__%s.json' % (kind, safe)
     data = json.dumps(_jsonable(obj), allow_nan=False, indent=2).encode('utf-8')
     last_exc = None
     for attempt in range(2):
@@ -376,20 +395,22 @@ def put_omero_json(image_id, kind, obj):
                 img = conn.getObject('Image', int(image_id))
                 if img is None:
                     raise ValueError("OMERO image %s not found" % image_id)
-                old_ids = [a.getId() for a in img.listAnnotations(ns=ns)]
+                # Replace only this name's annotation (+ sweep legacy nameless).
+                old_ids = [a.getId() for a in img.listAnnotations(ns=ns)
+                           if _gater_ann_name_of(a) in ('', name)]
                 fd, tmp_path = tempfile.mkstemp(suffix='.json', prefix='gater_')
                 with os.fdopen(fd, 'wb') as fh:
                     fh.write(data)
                 file_ann = conn.createFileAnnfromLocalFile(
                     tmp_path, origFilePathAndName=filename,
-                    mimetype='application/json', ns=ns)
+                    mimetype='application/json', ns=ns, desc=name)
                 img.linkAnnotation(file_ann)
                 if old_ids:
                     conn.deleteObjects(
                         'Annotation', old_ids, deleteAnns=True, wait=True)
             return True
         except ValueError as exc:
-            print("put_omero_json (%s): %s" % (kind, exc))
+            print("put_omero_json (%s/%s): %s" % (kind, name, exc))
             return False
         except Exception as exc:  # noqa: BLE001 - connection loss etc.
             last_exc = exc
@@ -407,16 +428,24 @@ def put_omero_json(image_id, kind, obj):
                     os.remove(tmp_path)
                 except Exception:
                     pass
-    print("put_omero_json (%s) failed after retry: %s" % (kind, last_exc))
+    print("put_omero_json (%s/%s) failed after retry: %s"
+          % (kind, name, last_exc))
     return False
 
 
-def get_omero_json(image_id, kind):
-    """Return the parsed JSON from the NEWEST Gater FileAnnotation of this
-    namespace on the OMERO Image, or None if absent/unreadable. Best-effort:
-    never raises (a None result triggers the caller's local fallback)."""
+def get_omero_json(image_id, kind, dataset_name):
+    """Return the parsed JSON from the NEWEST Gater FileAnnotation scoped to
+    (image, kind, dataset_name) -- namespace _GATER_NS[kind] with DESCRIPTION
+    == dataset_name -- or None if absent/unreadable. Best-effort: never raises
+    (a None result triggers the caller's local fallback).
+
+    Note: legacy image-keyed annotations (no description, written before
+    re-keying) do NOT match a named lookup, so they fall back to local until
+    the next save re-writes them under a name.
+    """
     global _omero_conn
     ns = _GATER_NS[kind]
+    want = str(dataset_name)
     for attempt in range(2):
         try:
             with _omero_lock:
@@ -426,6 +455,8 @@ def get_omero_json(image_id, kind):
                     return None
                 best = None
                 for a in img.listAnnotations(ns=ns):
+                    if _gater_ann_name_of(a) != want:
+                        continue
                     if best is None or a.getId() > best.getId():
                         best = a
                 if best is None:
@@ -443,9 +474,73 @@ def get_omero_json(image_id, kind):
                     _omero_conn = None
                     _clear_omero_caches()
                 continue
-            print("get_omero_json (%s): %s" % (kind, exc))
+            print("get_omero_json (%s/%s): %s" % (kind, want, exc))
             return None
     return None
+
+
+def list_omero_config_names(image_id):
+    """Dataset names that already have a saved Gater config annotation on this
+    OMERO image = the annotation descriptions under the config namespace. Cheap:
+    reads metadata only, no file bodies. Returns [] on any failure. Used to
+    populate the wizard's "Start from" selector."""
+    global _omero_conn
+    ns = _GATER_NS['config']
+    for attempt in range(2):
+        try:
+            with _omero_lock:
+                conn = _ensure_omero_connection()
+                img = conn.getObject('Image', int(image_id))
+                if img is None:
+                    return []
+                names = []
+                for a in img.listAnnotations(ns=ns):
+                    nm = _gater_ann_name_of(a)
+                    if nm and nm not in names:
+                        names.append(nm)
+            return sorted(names)
+        except Exception as exc:  # noqa: BLE001 - connection loss etc.
+            if attempt == 0:
+                with _omero_lock:
+                    try:
+                        if _omero_conn is not None:
+                            _omero_conn.close()
+                    except Exception:
+                        pass
+                    _omero_conn = None
+                    _clear_omero_caches()
+                continue
+            print("list_omero_config_names: %s" % exc)
+            return []
+    return []
+
+
+def inherit_render_state(image_id, src_name, dst_name):
+    """Copy the channel_list + gating_list render state saved under src_name on
+    the OMERO image into dst_name -- an INDEPENDENT copy, so a newly-created
+    datasource starts from an existing one's colors/ranges/gates without linking
+    to it. Writes both the local SQLite store (so it loads immediately) and the
+    OMERO annotation (so it round-trips like any other save). Best-effort per
+    kind; a missing source kind is simply skipped."""
+    for kind, model in (('channel_list', database_model.ChannelList),
+                        ('gating_list', database_model.GatingList)):
+        try:
+            state = None
+            if image_id is not None:
+                state = get_omero_json(image_id, kind, src_name)
+            if state is None:   # fall back to the source's local copy
+                row = database_model.get(model, datasource=src_name)
+                if row is not None:
+                    state = pickle.loads(row.cells)
+            if state is None:
+                continue
+            database_model.save_list(
+                model, datasource=dst_name, cells=pickle.dumps(state, protocol=4))
+            if image_id is not None:
+                put_omero_json(image_id, kind, dst_name, state)
+        except Exception as exc:  # noqa: BLE001
+            print("inherit_render_state (%s: %s -> %s): %s"
+                  % (kind, src_name, dst_name, exc))
 
 
 def get_omero_channel_info(image_id, name_prefix='channel'):
@@ -1092,14 +1187,14 @@ def save_gating_list(datasource_name, gates, channels, lassos):
     # Mirror render state to OMERO (best-effort; local DB above is the fallback).
     image_id = _omero_image_id_for(datasource_name)
     if image_id is not None:
-        put_omero_json(image_id, 'gating_list', temp)
+        put_omero_json(image_id, 'gating_list', datasource_name, temp)
 
 
 def get_saved_gating_list(datasource_name):
     # OMERO primary: return the render state stored on the Image if present.
     image_id = _omero_image_id_for(datasource_name)
     if image_id is not None:
-        remote = get_omero_json(image_id, 'gating_list')
+        remote = get_omero_json(image_id, 'gating_list', datasource_name)
         if remote is not None:
             return remote
     # Local fallback (unchanged: raises if nothing saved anywhere yet).
@@ -1107,7 +1202,7 @@ def get_saved_gating_list(datasource_name):
     local = pickle.loads(gating_list.cells)
     # Seed-on-load: copy the local state up to OMERO so it exists there next time.
     if image_id is not None:
-        put_omero_json(image_id, 'gating_list', local)
+        put_omero_json(image_id, 'gating_list', datasource_name, local)
     return local
 
 
@@ -1166,14 +1261,14 @@ def save_channel_list(datasource_name, map_channels, active_channels, list_color
     # Mirror render state to OMERO (best-effort; local DB above is the fallback).
     image_id = _omero_image_id_for(datasource_name)
     if image_id is not None:
-        put_omero_json(image_id, 'channel_list', temp)
+        put_omero_json(image_id, 'channel_list', datasource_name, temp)
 
 
 def get_saved_channel_list(datasource_name):
     # OMERO primary: return the render state stored on the Image if present.
     image_id = _omero_image_id_for(datasource_name)
     if image_id is not None:
-        remote = get_omero_json(image_id, 'channel_list')
+        remote = get_omero_json(image_id, 'channel_list', datasource_name)
         if remote is not None:
             return remote
     # Local fallback (unchanged: raises if nothing saved anywhere yet).
@@ -1181,7 +1276,7 @@ def get_saved_channel_list(datasource_name):
     local = pickle.loads(channel_list.cells)
     # Seed-on-load: copy the local state up to OMERO so it exists there next time.
     if image_id is not None:
-        put_omero_json(image_id, 'channel_list', local)
+        put_omero_json(image_id, 'channel_list', datasource_name, local)
     return local
 
 

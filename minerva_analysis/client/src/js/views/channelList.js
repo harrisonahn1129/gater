@@ -279,54 +279,62 @@ class ChannelList {
 
         let defaultRange = this.dataLayer.imageBitRange;
 
-        // this.eventHandler.trigger(ChannelList.events.RESET_LISTS);
+        // Apply the saved/uploaded channel config IDEMPOTENTLY, so it is safe to
+        // run repeatedly -- the on-open auto-restore AND a later "Load from
+        // OMERO" click both land on the same state. For each channel we set its
+        // range + color connectors, then bring its active state to the saved
+        // value by toggling ONLY when it differs from the current one
+        // (this.selections is the reliable active list). The old code toggled
+        // unconditionally, so a second run flipped already-active channels OFF
+        // (reset-to-default) and flashed default<->saved.
         _.each(channels, col => {
+            if (!this.sliders.get(col.channel)) return;
+
             let fullName = this.dataLayer.getFullChannelName(col.channel);
             let channelIdx = imageChannels[fullName];
             let channelID = this.channelIDs[col.channel];
+            let isActive = _.includes(this.selections, col.channel);
 
-            if (this.sliders.get(col.channel)) {
-                if (this.currentChannels[channelIdx]) {
-                        let channel_selector = `#channel-slider_${channelID}`;
-                        document.querySelector(channel_selector).click();
-                }
+            // Range connector (channel_add reads this on activation).
+            if (col.start > this.image_channels[col.channel][0] || col.end < this.image_channels[col.channel][1]) {
+                this.rangeConnector[channelIdx] = [col.start / defaultRange[1], col.end / defaultRange[1]];
+            } else {
+                delete this.rangeConnector[channelIdx];
             }
-        })
 
-        this.currentChannels = {};
-        this.rangeConnector = {};
-        this.colorConnector = {};
+            // Color connector MUST be a d3.rgb -- that is the shape channel_add /
+            // updateChannelColors and the WebGL renderer expect (the color
+            // picker stores d3.rgb). Storing a plain {r,g,b} object rendered as
+            // default white: the actual "color not restored" bug.
+            let hasColor = (col.r !== 255 || col.g !== 255 || col.b !== 255);
+            if (hasColor) {
+                let swatch = document.querySelector(`#color_${channelID}`);
+                if (swatch) swatch.style.fill = `rgb(${col.r}, ${col.g}, ${col.b})`;
+                this.colorConnector[channelIdx] = {color: d3.rgb(col.r, col.g, col.b)};
+            } else {
+                delete this.colorConnector[channelIdx];
+            }
 
-        _.each(channels, col => {
-            let fullName = this.dataLayer.getFullChannelName(col.channel);
-            let channelIdx = imageChannels[fullName];
-            let channelID = this.channelIDs[col.channel];
-
-            if (this.sliders.get(col.channel)) {
-                if (col.start > this.image_channels[col.channel][0] || col.end < this.image_channels[col.channel][1]){
-                    this.sliders.get(col.channel).value([col.start, col.end]);
-                    this.rangeConnector[channelIdx] = [col.start / defaultRange[1], col.end / defaultRange[1]];
+            if (col['channel_active']) {
+                // Reflect the saved range on the slider.
+                this.sliders.get(col.channel).value([col.start, col.end]);
+                if (!isActive) {
+                    // Activate: channel_add picks up the range + color connectors.
+                    document.querySelector(`#channel-slider_${channelID}`).click();
                 }
-
-                if (col.r !== 255 || col.g !== 255 || col.b !== 255) {
-                    let rgbColor = `rgb(${col.r}, ${col.g}, ${col.b})`;
-                    let selectorColor = `#color_${channelID}`;
-                    // document.querySelector(selectorColor).setAttribute("fill", rgbColor);
-                    let selectorDoc = document.querySelector(selectorColor);
-                    selectorDoc.style.fill = rgbColor;
-                    let channelColor = {
-                        r: col.r,
-                        g: col.g,
-                        b: col.b,
-                        opacity: col.opacity
-                    };
-                    this.colorConnector[channelIdx] = {color: channelColor};
+                // updateChannelColors only applies to an ALREADY-active channel,
+                // so fire this after activation -- covers both fresh-activate and
+                // recolor-in-place (button click on an already-active channel).
+                if (hasColor) {
+                    this.eventHandler.trigger(ChannelList.events.COLOR_TRANSFER_CHANGE, {
+                        name: col.channel,
+                        type: 'white',
+                        color: d3.rgb(col.r, col.g, col.b)
+                    });
                 }
-
-                if (col['channel_active']) {
-                    let selector = `#channel-slider_${channelID}`;
-                    document.querySelector(selector).click();
-                }
+            } else if (isActive) {
+                // Saved as inactive but currently active -> turn it off.
+                document.querySelector(`#channel-slider_${channelID}`).click();
             }
         })
     }

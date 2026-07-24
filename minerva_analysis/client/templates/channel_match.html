@@ -10,6 +10,19 @@
                 <h2>{{ data.datasetName }}: Config</h2>
             </div>
             <div class="col-auto ml-auto" id="save-col">
+                {% if data.prior_configs %}
+                <span id="start-from-wrap" style="display:inline-block; margin-right:14px;">
+                    <label for="base-config-select" style="margin-right:6px; font-weight:500;">Start from:</label>
+                    <select id="base-config-select" class="form-control"
+                            style="display:inline-block; width:auto; vertical-align:middle;"
+                            title="Seed this datasource's channel colors/ranges and gates from a previously-saved config on the same image (an independent copy).">
+                        <option value="">Default (fresh)</option>
+                        {% for name in data.prior_configs %}
+                        <option value="{{ name }}">{{ name }}</option>
+                        {% endfor %}
+                    </select>
+                </span>
+                {% endif %}
                 <button id="save" type="button" class="btn btn-secondary save-config">Save Config</button>
             </div>
         </div>

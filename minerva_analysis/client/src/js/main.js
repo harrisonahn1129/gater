@@ -214,4 +214,21 @@ async function init(config) {
         seaDragonViewer.forceRepaint();
     };
     eventHandler.bind(ImageViewer.events.addScaleBar, add_scalebar);
+
+    // Auto-restore saved render state (channel colors/ranges + gating) on open,
+    // so a datasource whose config was saved to OMERO comes back as saved
+    // instead of at defaults -- without the user having to click "Load from
+    // OMERO". Runs after all event bindings so applyChannels' COLOR_TRANSFER_-
+    // CHANGE and applyGates' events are handled. Best-effort: a datasource with
+    // no saved state simply no-ops.
+    try {
+        await channelList.applyChannels('db');
+    } catch (e) {
+        console.log('Auto-restore channels skipped:', e);
+    }
+    try {
+        await csv_gatingList.applyGates('db');
+    } catch (e) {
+        console.log('Auto-restore gating skipped:', e);
+    }
 }

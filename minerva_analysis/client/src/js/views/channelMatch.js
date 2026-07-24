@@ -269,10 +269,12 @@ function submitForm() {
     let headerList = serializeForm();
     document.getElementById('save').innerHTML += '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>'
 
+    let baseSelect = document.getElementById('base-config-select');
     let postData = {
         originalData: channelData,
         headerList: headerList,
-        transformData: $('#transform-data').is(':checked')
+        transformData: $('#transform-data').is(':checked'),
+        baseConfig: baseSelect ? baseSelect.value : ''
     };
 
     if ($('.optional') && $('.optional').is(":visible")) {

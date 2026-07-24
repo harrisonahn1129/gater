@@ -596,10 +596,16 @@ def save_config():
             # Mirror the finalized config entry to OMERO (best-effort backup /
             # portability). Local config.json stays the bootstrap loader, since
             # it is also the index that maps datasource -> omero_image_id.
-            if configData[datasetName].get('omero_image_id'):
+            image_id = configData[datasetName].get('omero_image_id')
+            if image_id:
                 data_model.put_omero_json(
-                    configData[datasetName]['omero_image_id'], 'config',
-                    configData[datasetName])
+                    image_id, 'config', datasetName, configData[datasetName])
+            # "Start from" option: seed this new datasource's render state
+            # (channel colors/ranges, gates) from a previously-saved config on
+            # the SAME image, chosen in the wizard. Independent copy.
+            base_config = request.json.get('baseConfig')
+            if base_config and base_config != datasetName:
+                data_model.inherit_render_state(image_id, base_config, datasetName)
             resp = jsonify(success=True)
             return resp
 
@@ -921,7 +927,7 @@ def open_from_omero_run():
         #     and jump straight into the viewer. Render state (colors/gates) then
         #     comes back on its own via the OMERO-primary get_saved_* reads.
         current_task = "Checking for saved configuration"
-        stored_config = data_model.get_omero_json(omero_image_id, 'config')
+        stored_config = data_model.get_omero_json(omero_image_id, 'config', datasetName)
         restored = _restore_config_entry(
             stored_config, datasetName, serverCsvPath, str(seg_ometiff),
             int(omero_image_id))
@@ -990,6 +996,12 @@ def open_from_omero_run():
             config_data['isTransformed'] = bool(np.mean(np.mean(dImg)) < 15)
         except Exception:
             config_data['isTransformed'] = False
+
+        # Other Gater datasources already saved on this image -> the wizard's
+        # "Start from" selector (seed this new name's render state from one).
+        config_data['prior_configs'] = [
+            n for n in data_model.list_omero_config_names(omero_image_id)
+            if n != datasetName]
 
         completed_task = 6
         current_task = "Complete"
