@@ -4,7 +4,7 @@ Single reference for the OMERO integration on branch `feature/omero_gater_deploy
 built, how it runs, how it is meant to be deployed, and what is still open.
 
 **Consolidates and supersedes** the previous `OMERO_INTEGRATION_REPORT.md` (engineering log),
-`architecture.md` (runtime reference) and `DEPLOYMENT_PLAN.md` (deployment plan).
+`architecture.md` (runtime reference) and `DEPLOYMENT_PLAN.md` (deployment plan) in the documentations directory.
 
 **Companions:** `README.md` — what the app is and how to run it. `security_review.md` — the
 security/privacy briefing for NYU Langone Information Security.
