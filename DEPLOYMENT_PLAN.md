@@ -359,3 +359,88 @@ Phase 2 per-user-pod model (§1, §5). Fine-grained per-commit detail lives in
 - **FLAG 8 — Legacy image-keyed annotations.** Annotations saved before the `(image, name)` re-keying
   have no description → don't match named reads; superseded on the next save. Any pre-re-keying test
   annotations should be re-saved to migrate cleanly.
+
+---
+
+## 12. Session state — where we left off (as of 2026-07-30)
+
+Running log of the deployment-planning discussion so we can resume without re-deriving. Companion
+docs: `architecture.md` (deep Workflows A/B/C + concurrency/state model) and `OMERO_INTEGRATION_REPORT.md`
+§11 (per-commit history).
+
+### 12.1 Decisions made
+- **Repo strategy (fork → PR).** `gater/` is a fork of the lab repo (`origin` = `harrisonahn1129/gater`;
+  lab repo not yet a remote). Push work to the fork, open a **PR** to the lab; don't push their `main`.
+  Add `upstream` read-only to rebase before PR. Set a stable `git config user.name/email` (commits are
+  auto-attributed to a drifting hostname).
+- **App-vs-infra split.** The lab wants the **Gater app features** (OMERO ingestion, live-tile, render/config
+  storage) → stay in the fork → PR upstream. **Deployment infra** (`omero-gater` plugin, `gater-spawner`,
+  `docker-compose*.yml`, K8s) → a **separate PRIVATE deploy repo** with `main`/`staging`/`feature`.
+  Boundary: "how to build the Gater image" = app fork's `Dockerfile`; "how to run the stack" = deploy repo.
+- **Upstream-PR Docker choice (leaning):** keep OMERO deps (`omero-py`/`zeroc-ice`) OUT of the base
+  `Dockerfile`/`requirements.yml` (app imports are lazy, so local mode still works) and add them in the
+  **deploy-repo image** that `FROM`s the base — keeps the lab image lean and avoids the ARM64/Ice build.
+- **Versioning is purely git-tag-based** (no version file). A tag `vN_gater` IS the release; pushing it
+  triggers `dockerhub.yml` (needs DockerHub secrets). **Tags `v1.35_gater`/`v1.36_gater` left LOCAL** (not
+  pushed) for now — no big deal.
+- **What actually runs on K8s** (corrected): NOT the plugin. The plugin installs into NYU's OMERO.web.
+  On K8s we deploy the **spawner** (Deployment+Service+Ingress+RBAC+ConfigMap); it dynamically creates
+  per-user Gater Deployments/Services/Ingresses via the K8s API. **OMERO is external** (host:port); the
+  `docker-compose` OMERO stack is **local-dev only**.
+
+### 12.2 Current repo / asset state
+- `feature/omero_gater_deployment` is now **pushed to the fork** (`origin`). Tags `v1.35_gater`/`v1.36_gater`
+  remain local. Latest commit: `709c37faa` (v1.36_gater).
+- `omero-gater/` and `gater-spawner/` are **NOT git repos** (clean to consolidate into the private deploy repo).
+  The `omero-gater` OMERO.web "Open" selector edits are **untracked** working-tree changes.
+- Existing deploy assets (mature): spawner code (`spawner/app.py`, `k8s.py`, `culler.py`, `config.py`),
+  `deploy/rbac.yaml` (CORRECT: CRUD on deployments/services/ingresses, read pods), `deploy/spawner-deployment.yaml`,
+  the packaged plugin, and the dev `docker-compose*.yml`. Per-user pod resource limits are ALREADY in
+  `config.py` (`POD_MEM_LIMIT` default **4Gi** — verify it holds for the tonsil dataset).
+- `probe_omero_live.py` written (untracked, in `gater/`) to test FLAG 5 on the real OMERO — not yet run.
+
+### 12.3 The two decisions that gate the deploy structure
+1. **Can we add the plugin to NYU's EXISTING OMERO.web (modify-in-place) or must we stand up a parallel one?**
+   → §12.4 pathologist questions. Everything downstream branches on this.
+2. **Does NYU's OMERO.web run on the same K8s cluster** (then we add an `omero-web-gater` workload) **or is it
+   NYU-managed elsewhere** (we just ship the plugin)? We never run the OMERO server/DB (NYU's data tier).
+
+### 12.4 Questions for the pathologist / end-user (ASK FIRST)
+The pathologist is the end user, not the admin, but is our conduit. → = route to IT/admin/compliance.
+
+**P1 — OMERO.web hosting & plugin (the top fork):**
+- How do you access OMERO today (URL; a website you log into)?
+- Who runs that OMERO server — your lab, a shared imaging **core facility**, or central NYU IT? →
+- Shared long-standing instance (be non-disruptive) or dedicated to you?
+- Would your admin add a small plugin to that existing OMERO.web + restart it, or require a separate one? →
+- OMERO version (needs ≥5.6)? →
+
+**P2 — Data shape in OMERO:**
+- What are your images (WSI QPTIFF/SVS, multiplex/CyCIF; #channels; ~GB)?
+- Quantification stored how — a CSV attached to the image, an OMERO table, or from a separate tool?
+- Segmentation mask stored how — attached file/zip, a separate OMERO **label image**, or not in OMERO? *(decides FLAG 5)*
+- Do you analyze/gate the same image multiple times under different names?
+
+**P3 — Workflow & expectations:**
+- Walk through what you do with an image in OMERO today — where does "Open in Gater" fit?
+- Acceptable wait when first opening an image (seg-pyramid build = minutes)?
+- Need channel colors/gates saved and to return later / on another machine?
+- How many users; any concurrent viewing?
+
+**P4 — Login, identity & compute:**
+- Login via institutional SSO or an OMERO username/password? → *(shapes `joinSession` auth)*
+- Existing NYU Kubernetes/compute we deploy onto, or provision one? Who owns it? →
+
+**P5 — Governance / compliance (cancer center — don't skip):**
+- Is the data PHI/HIPAA-regulated? De-identified? →
+- Restriction on where data is processed (on-prem-only, no cloud)? →
+- Who signs off on data-use/IRB? →
+
+### 12.5 Next steps (resume here)
+1. Get **P1** answered by the pathologist/their OMERO admin — it unblocks the deploy structure.
+2. Run `probe_omero_live.py` against the real OMERO → resolves FLAG 5 (seg live-tile feasibility).
+3. Once P1 known: scaffold the **private deploy repo** (consolidate `omero-gater/` + `gater-spawner/` +
+   compose + this doc; Kustomize base/overlays; spawner ConfigMap/NetworkPolicy) — corrected spawner-centric
+   `deploy/` from §12.1.
+4. Design the `joinSession` per-user auth handshake (§10.4) — the biggest gap to real multi-user.
+5. (Lower priority) revisit the two known-open frontend bugs (channel color restore; gating seg-mask vanish).
