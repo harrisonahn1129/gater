@@ -79,7 +79,7 @@ The integration adds a **second mode** in which the channel image is never downl
 evaluated per datasource and per tile request, switches between them:
 
 ```
-config[datasource]['omero_image_id'] set  AND  'channelFile' == ''   →  OMERO live-tile mode
+config[datasource]['omero_image_id'] set  AND  'channelFile' == ''   →  OMERO live-tile mode (Needs deployment)
 otherwise                                                            →  local-file mode
 ```
 
@@ -89,7 +89,7 @@ integration is surgically contained to **(A) import, (B) channel-tile serving, (
 state storage**.
 
 In OMERO mode the **image is streamed and never copied**; the quantification table and
-segmentation mask are still materialized on local disk (see FLAG 5, §10).
+segmentation mask are still materialized on local disk; streaming needs to be tested (see FLAG 5, §10).
 
 ### 2.3 The three converters
 

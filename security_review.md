@@ -76,7 +76,7 @@ shared, network-reachable, clinical-adjacent service.
 
 ## 2. Architecture and trust boundaries
 
-### 2.1 Target design (what we are asking you to review)
+### 2.1 Target design (what needs review)
 
 ```
  ┌─ NYU-owned, existing ─────────────────────────────────────────────┐
@@ -93,7 +93,9 @@ shared, network-reachable, clinical-adjacent service.
  ┌─ new, cluster-internal ───────────────────────────────────────────┐
  │  gater-spawner (FastAPI, holds a Kubernetes ServiceAccount)       │
  │      │ (3) creates/patches a Deployment+Service+Ingress per user; │
- │      │     the session UUID is injected as a plaintext env var    │
+ │      │     the session UUID is injected as a plaintext env var ←  │
+ │      │     it could use single-use short-TTL instead to deliver   │
+ │      │     the credential                                         │
  │      ▼                                                            │
  │  Per-user Gater pod (Flask; no authentication of its own)         │
  └──────┬────────────────────────────────────────────────────────────┘
