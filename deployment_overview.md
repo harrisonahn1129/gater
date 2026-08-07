@@ -737,29 +737,47 @@ questions.
 The pathologist is the end user rather than the administrator, but is our conduit. → = route to
 IT, the OMERO administrator, or compliance.
 
-**P1 — OMERO.web hosting and the plugin (the top fork).** How do you reach OMERO today (URL)? Who
-runs that server — your lab, a shared imaging **core facility**, or central NYU IT? → Is it a
-shared long-standing instance (be non-disruptive) or dedicated? Would your administrator add a
-small plugin to that existing OMERO.web and restart it, or require a separate instance? → What
-OMERO version (needs ≥ 5.6)? →
+**P1 — OMERO.web hosting and the plugin (the top fork).** 
+***How do you reach OMERO today (URL)?***
 
-**P2 — Data shape in OMERO.** What are the images (WSI QPTIFF/SVS, multiplex/CyCIF; how many
-channels; roughly how many GB)? How is quantification stored — a CSV attached to the image, an
-OMERO table, or produced by a separate tool? How is the segmentation mask stored — an attached
-file/zip, a separate OMERO **label image**, or not in OMERO at all? *(This decides FLAG 5.)* Do
-you analyze the same image several times under different names?
+***Who runs that server — your lab, a shared imaging **core facility**, or central NYU IT?***
 
-**P3 — Workflow and expectations.** Walk through what you do with an image in OMERO today — where
-does "Open in Gater" fit? What is an acceptable wait when first opening an image (the segmentation
-pyramid build takes minutes)? Do you need channel colours and gates saved so you can return later
-or work from another machine? How many users, and any concurrent viewing?
+***Is it a shared long-standing instance (be non-disruptive) or dedicated?***
 
-**P4 — Login and compute.** Do you log in with institutional SSO or an OMERO username/password? →
-*(shapes the identity model)* Is there existing NYU Kubernetes/compute we deploy onto, or must one
-be provisioned? Who owns it? →
+***Would your administrator add a small plugin to that existing OMERO.web and restart it, or require a separate instance?***
 
-**P5 — Governance.** Is the data PHI/HIPAA-regulated? De-identified? → Any restriction on where it
-may be processed (on-prem only, no cloud)? → Who signs off on data use / IRB? →
+***What OMERO version (needs ≥ 5.6)***
+
+**P2 — Data shape in OMERO.** 
+***What are the images (WSI QPTIFF/SVS, multiplex/CyCIF; how many channels; roughly how many GB)?***
+
+***How is quantification stored — a CSV attached to the image, an OMERO table, or produced by a separate tool?***
+A: An OMERO table
+
+***How is the segmentation mask stored — an attached file/zip, a separate OMERO **label image**, or not in OMERO at all?*** *(This decides FLAG 5.)* 
+A: An attached Zarr file
+
+***Do you analyze the same image several times under different names?***
+A: They do perform the gating multiple times on the same image (data) until they finalize.
+
+**P3 — Workflow and expectations.** 
+***What is an acceptable wait when first opening an image (the segmentation pyramid build takes 1 ~ 2 minutes)?***
+
+***How many users, and any concurrent viewing?***
+
+**P4 — Login and compute.** 
+***Do you log in with institutional SSO or an OMERO username/password?*** *(shapes the identity model)* 
+A: OMERO username/password
+
+***Is there existing NYU Kubernetes/compute we deploy onto, or must one be provisioned? Who owns it?***
+A: We will be requesting NYU Kubernetes access and deploy our Gater app, which the OMERO-Gater plugin will redirect to when the users open the Gater app from the OMERO.web
+
+**P5 — Governance.** 
+***Is the data PHI/HIPAA-regulated? De-identified?*** 
+
+***Any restriction on where it may be processed (on-prem only, no cloud)?***
+
+***Who signs off on data use / IRB?***
 
 ### 11.2 For NYU IT / infrastructure
 
