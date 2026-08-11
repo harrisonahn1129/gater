@@ -11,6 +11,7 @@ import gzip
 import json
 import orjson
 import os
+import threading
 from os import walk
 from flask_sqlalchemy import SQLAlchemy
 
@@ -173,20 +174,10 @@ def upload_gates():
     resp = jsonify(success=True)
     return resp
 
-@app.route('/upload_channels', methods=['POST'])
-def upload_channels():
-    file = request.files['file']
-    if file.filename.endswith('.csv') == False:
-        abort(422)
-    datasource = request.form['datasource']
-    save_path = data_path / datasource
-    if save_path.is_dir() == False:
-        abort(422)
-
-    filename = 'uploaded_channels.csv'
-    file.save(Path(save_path / filename))
-    resp = jsonify(success=True)
-    return resp
+# NOTE: the old '/upload_channels' route (local file -> uploaded_channels.csv on
+# the server's disk) was replaced by the OMERO CSV routes below. Channel CSVs
+# now live as attachments on the OMERO image, which also removes a per-datasource
+# disk write from the pod (see FLAG 5, deployment_overview.md).
 
 @app.route('/get_rect_cells', methods=['GET'])
 def get_rect_cells():
@@ -215,31 +206,9 @@ def get_ome_metadata():
     return response
 
 
-@app.route('/download_gating_csv', methods=['POST'])
-def download_gating_csv():
-    datasource = request.form['datasource']
-    filename = request.form['filename']
-
-    filter = json.loads(request.form['filter'])
-    channels = json.loads(request.form['channels'])
-    lassos = json.loads(request.form['lassos'])
-    selection_ids = json.loads(request.form['selection_ids'])
-    fullCsv = json.loads(request.form['fullCsv'])
-    encoding = request.form['encoding']
-    if fullCsv:
-        csv = data_model.download_gating_csv(datasource, filter, channels, selection_ids, encoding)
-        return Response(
-            csv.to_csv(index=False),
-            mimetype="text/csv",
-            headers={"Content-disposition":
-                         "attachment; filename=" + filename + ".csv"})
-    else:
-        csv = data_model.download_gates(datasource, filter, channels, lassos)
-        return Response(
-            csv.to_csv(index=False),
-            mimetype="text/csv",
-            headers={"Content-disposition":
-                         "attachment; filename=" + filename + ".csv"})
+# NOTE: '/download_gating_csv' (which streamed the gating CSVs back as browser
+# downloads) was replaced by '/save_gating_csv_to_omero' below -- the gating
+# panel now writes both CSVs to the OMERO image instead.
 
 @app.route('/save_gating_list', methods=['POST'])
 def save_gating_list():
@@ -261,22 +230,224 @@ def get_saved_gating_list():
     resp = data_model.get_saved_gating_list(datasource)
     return serialize_and_submit_json(resp)
 
-@app.route('/download_channels_csv', methods=['POST'])
-def download_channels_csv():
-    filename = request.form['filename']
+# --- CSV saves to OMERO ---------------------------------------------------
+# Writing a CSV can be slow: the per-cell gating export covers the whole
+# quantification table, which is hundreds of MB on a real slide and takes ~a
+# minute. Waitress serves on a small thread pool, so several of those at once
+# starve every other request (tiles included) and the app looks frozen -- and
+# each one holds another full copy of the table, which is how it ends up
+# OOM-killed. So: ONE CSV save at a time, process-wide. A second request is
+# refused immediately rather than queued, which keeps its thread free.
+#
+# Holding the lock across the existence check AND the write also closes the
+# race that let several concurrent saves each see "name is free" and then all
+# write the same name.
+_csv_save_lock = threading.Lock()
+_csv_save_state = {'active': False, 'stage': '', 'name': '', 'started': 0.0}
 
-    datasource = request.form['datasource']
-    map_channels = json.loads(request.form['map_channels'])
-    active_channels = json.loads(request.form['active_channels'])
-    list_colors = json.loads(request.form['list_colors'])
-    list_ranges = json.loads(request.form['list_ranges'])
-    list_channels = json.loads(request.form['list_channels'])
-    csv = data_model.download_channels(datasource, map_channels, active_channels, list_colors, list_ranges, list_channels)
-    return Response(
-        csv.to_csv(index=False),
-        mimetype="text/csv",
-        headers={"Content-disposition":
-                     "attachment; filename=" + filename + ".csv"})
+
+def _csv_save_stage(stage):
+    _csv_save_state['stage'] = stage
+
+
+@app.route('/csv_save_status', methods=['GET'])
+def csv_save_status():
+    """Cheap poll target for the client's progress overlay."""
+    state = dict(_csv_save_state)
+    state['elapsed'] = round(time() - state['started'], 1) if state['active'] else 0
+    return jsonify(state)
+
+
+def _csv_save_busy_response():
+    return jsonify(
+        error=("Another CSV save is already in progress%s. Please wait for it "
+               "to finish before starting another."
+               % (' ("%s")' % _csv_save_state['name']
+                  if _csv_save_state['name'] else '')),
+        busy=True), 409
+
+
+# --- Channel CSV on OMERO -------------------------------------------------
+# These three routes replace the old local-file pair (/upload_channels +
+# /download_channels_csv). Errors come back as JSON {error: "..."} so the UI can
+# show the reason instead of a generic failure.
+
+def _omero_image_id_or_error(datasource):
+    """(image_id, None) or (None, json_error_response). The channel CSV lives on
+    the OMERO image, so a purely local datasource has nowhere to read/write it."""
+    image_id = data_model._omero_image_id_for(datasource)
+    if image_id is None:
+        return None, (jsonify(error=(
+            "This datasource is not backed by an OMERO image, so there is no "
+            "image to read channel CSVs from or save them to.")), 422)
+    return image_id, None
+
+
+@app.route('/save_channels_csv_to_omero', methods=['POST'])
+def save_channels_csv_to_omero():
+    """Save the current channel settings as a named CSV attachment on the image.
+
+    Same content as /save_channel_list, but written as text/csv so it can be
+    downloaded from OMERO.web or opened in a spreadsheet. The user names the
+    file, so one image can hold several. Saving over an existing name requires
+    an explicit overwrite=true: without it this returns 409 {exists: true} so
+    the UI can ask. Re-checking here (not just in the browser) means a name
+    created since the UI listed them still cannot be clobbered silently.
+    """
+    post_data = json.loads(request.data)
+    datasource = post_data['datasource']
+    image_id, err = _omero_image_id_or_error(datasource)
+    if err:
+        return err
+
+    name = data_model.canonical_csv_name(post_data.get('csv_name'), datasource)
+    if not _csv_save_lock.acquire(blocking=False):
+        return _csv_save_busy_response()
+    try:
+        _csv_save_state.update(active=True, stage='Preparing channel list',
+                               name=name, started=time())
+        if not post_data.get('overwrite') and \
+                data_model.omero_csv_name_exists(image_id, 'channel_csv', name):
+            return jsonify(
+                error='A channel CSV named "%s" already exists on this image.' % name,
+                exists=True, name=name), 409
+
+        csv = data_model.download_channels(
+            datasource, post_data['map_channels'], post_data['active_channels'],
+            post_data['list_colors'], post_data['list_ranges'],
+            post_data['list_channels'])
+        _csv_save_stage('Uploading to OMERO')
+        ok = data_model.put_omero_csv(image_id, 'channel_csv', name, csv)
+    finally:
+        _csv_save_state.update(active=False, stage='', name='')
+        _csv_save_lock.release()
+    if not ok:
+        return jsonify(error="Could not write the CSV to OMERO. The channel "
+                             "settings were not saved."), 502
+    return jsonify(success=True, rows=int(len(csv)), name=name)
+
+
+@app.route('/list_omero_channel_csvs', methods=['GET'])
+def list_omero_channel_csvs():
+    """CSV attachments on this datasource's OMERO image, for the load picker."""
+    datasource = request.args.get('datasource')
+    image_id, err = _omero_image_id_or_error(datasource)
+    if err:
+        return err
+    return serialize_and_submit_json(
+        {'csvs': data_model.list_omero_csv_files(image_id, 'channel_csv')})
+
+
+@app.route('/get_omero_channel_csv_values', methods=['GET'])
+def get_omero_channel_csv_values():
+    """Parse a chosen CSV attachment into channel records for the client."""
+    datasource = request.args.get('datasource')
+    ann_id = request.args.get('ann_id')
+    image_id, err = _omero_image_id_or_error(datasource)
+    if err:
+        return err
+    if not ann_id:
+        return jsonify(error="No CSV attachment was selected."), 422
+    try:
+        records = data_model.get_omero_channel_csv_records(image_id, ann_id)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 422
+    return serialize_and_submit_json(records)
+
+
+# --- Gating CSV on OMERO --------------------------------------------------
+# Mirrors the channel CSV routes. Two kinds are written from the gating
+# download panel: the gate ranges (loadable back) and the per-cell encodings
+# (an export only), each in its own namespace so one never replaces the other.
+
+@app.route('/save_gating_csv_to_omero', methods=['POST'])
+def save_gating_csv_to_omero():
+    """Save the gating panel's CSV as a named attachment on the OMERO image.
+
+    fullCsv=false -> gate ranges (channel/gate_start/gate_end/gate_active plus
+    Lasso rows); fullCsv=true -> the per-cell encoding export, honouring the
+    panel's binary/intensity choice. Overwrite semantics match the channel CSV:
+    409 {exists: true} unless overwrite=true.
+    """
+    post_data = json.loads(request.data)
+    datasource = post_data['datasource']
+    image_id, err = _omero_image_id_or_error(datasource)
+    if err:
+        return err
+
+    full_csv = bool(post_data.get('fullCsv'))
+    kind = 'gating_cells_csv' if full_csv else 'gating_csv'
+    default_stem = '%s_gated_%s' % (
+        datasource, 'cell_encodings' if full_csv else 'channel_ranges')
+    name = data_model.canonical_csv_name(post_data.get('csv_name'), default_stem)
+    if not _csv_save_lock.acquire(blocking=False):
+        return _csv_save_busy_response()
+    try:
+        _csv_save_state.update(
+            active=True, name=name, started=time(),
+            stage='Building per-cell export' if full_csv else 'Collecting gates')
+        if not post_data.get('overwrite') and \
+                data_model.omero_csv_name_exists(image_id, kind, name):
+            return jsonify(
+                error='A CSV named "%s" already exists on this image.' % name,
+                exists=True, name=name), 409
+
+        if full_csv:
+            csv = data_model.download_gating_csv(
+                datasource, post_data['filter'], post_data['channels'],
+                post_data.get('selection_ids'),
+                post_data.get('encoding') or 'binary')
+        else:
+            csv = data_model.download_gates(
+                datasource, post_data['filter'], post_data['channels'],
+                post_data.get('lassos') or {})
+
+        _csv_save_stage('Uploading to OMERO')
+        # Pass the frame, not its CSV text: put_omero_csv streams it to disk so
+        # a multi-hundred-MB export is never held as str and bytes at once.
+        ok = data_model.put_omero_csv(image_id, kind, name, csv)
+    finally:
+        _csv_save_state.update(active=False, stage='', name='')
+        _csv_save_lock.release()
+    if not ok:
+        return jsonify(error="Could not write the CSV to OMERO. The gating "
+                             "was not saved."), 502
+    return jsonify(success=True, rows=int(len(csv)), name=name)
+
+
+@app.route('/list_omero_gating_csvs', methods=['GET'])
+def list_omero_gating_csvs():
+    """CSV attachments on this image, flagged against the gate-ranges kind.
+
+    `kind` selects which files the overwrite warning applies to; the caller
+    passes 'save' when naming a file to write and omits it when picking one to
+    load."""
+    datasource = request.args.get('datasource')
+    kind = request.args.get('kind') or 'gating_csv'
+    if kind not in ('gating_csv', 'gating_cells_csv'):
+        return jsonify(error="Unknown CSV kind."), 422
+    image_id, err = _omero_image_id_or_error(datasource)
+    if err:
+        return err
+    return serialize_and_submit_json(
+        {'csvs': data_model.list_omero_csv_files(image_id, kind)})
+
+
+@app.route('/get_omero_gating_csv_values', methods=['GET'])
+def get_omero_gating_csv_values():
+    """Parse a chosen CSV attachment into gating records for the client."""
+    datasource = request.args.get('datasource')
+    ann_id = request.args.get('ann_id')
+    image_id, err = _omero_image_id_or_error(datasource)
+    if err:
+        return err
+    if not ann_id:
+        return jsonify(error="No CSV attachment was selected."), 422
+    try:
+        records = data_model.get_omero_gating_csv_records(image_id, ann_id)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 422
+    return serialize_and_submit_json(records)
 
 @app.route('/save_channel_list', methods=['POST'])
 def save_channel_list():
@@ -304,15 +475,8 @@ def get_gating_csv_values():
     obj = csv.to_dict(orient='records')
     return serialize_and_submit_json(obj)
 
-@app.route('/get_uploaded_channel_csv_values', methods=['GET'])
-def get_channel_csv_values():
-    datasource = request.args.get('datasource')
-    file_path = data_path / datasource / 'uploaded_channels.csv'
-    if file_path.is_file() == False:
-        abort(422)
-    csv = pd.read_csv(file_path)
-    obj = csv.to_dict(orient='records')
-    return serialize_and_submit_json(obj)
+# NOTE: '/get_uploaded_channel_csv_values' (which read uploaded_channels.csv off
+# the server's disk) was replaced by '/get_omero_channel_csv_values' above.
 
 @app.route('/get_saved_channel_list', methods=['GET'])
 def get_saved_channel_list():

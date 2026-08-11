@@ -138,21 +138,38 @@ const getProperty = (scope: any, k: string | symbol) => {
   return typeof v === "function" ? v.bind(scope) : v;
 };
 
-const fakeCreateElement = (formCallback) => {
-  const { createElement } = document;
-  return (...args) => {
-    const el = createElement.apply(document, args);
-    if (args[0] == "form") {
-      el.submit = function() {
-        const els = [...this.elements];
-        const formData = els.reduce((o, i) => {
-          return {...o, [i.name]: i.value};
-        }, {});
-        formCallback(formData);
-      }
+// Drives one of the gating download-panel save buttons and returns the JSON
+// body it POSTed to OMERO (or null if it never posted). The CSVs now go to the
+// OMERO image over fetch, so this stubs fetch rather than intercepting a form
+// submit, and stubs alert because the success message would otherwise block.
+const saveGatingCsv = async (buttonId, inputId, name) => {
+  const panel = document.getElementById('gating_download_panel');
+  const { csv_gatingList } = __minervaAnalysis;
+  csv_gatingList.download_panel_visible = true;
+  (panel as HTMLElement).style.visibility = 'visible';
+  (document.getElementById(inputId) as HTMLInputElement).value = name;
+
+  let sent: any = null;
+  const fetchStub = sinon.stub(window, 'fetch').callsFake((url, init) => {
+    const u = String(url);
+    if (u.indexOf('/list_omero_gating_csvs') !== -1) {
+      // Nothing saved yet, so no overwrite confirm is raised.
+      return Promise.resolve(new Response(JSON.stringify({csvs: []}),
+        {status: 200, headers: {'Content-Type': 'application/json'}}));
     }
-    return el;
-  };
+    if (u.indexOf('/save_gating_csv_to_omero') !== -1) {
+      sent = JSON.parse(init.body);
+      return Promise.resolve(new Response(
+        JSON.stringify({success: true, rows: 0, name: sent.csv_name}),
+        {status: 200, headers: {'Content-Type': 'application/json'}}));
+    }
+    return (fetchStub as any).wrappedMethod.call(window, url, init);
+  });
+  sinon.stub(window, 'alert');
+  document.getElementById(buttonId).dispatchEvent(new Event('click'));
+  await sleeper(1);
+  sinon.restore();
+  return sent;
 }
 
 beforeEach(async () => {
@@ -211,9 +228,9 @@ beforeEach(async () => {
     ...KARMA_QUERY,
     channel: CHANNEL_ZERO 
   });
-  // Download channels
-  const channelsMock = mockServer.forPost("/download_channels_csv");
-  const gatingMock = mockServer.forPost("/download_gating_csv");
+  // Save the channel CSV (now an attachment on the OMERO image, not a download)
+  const channelsMock = mockServer.forPost("/save_channels_csv_to_omero");
+  const gatingMock = mockServer.forPost("/save_gating_csv_to_omero");
   // Await all endpoints
   await Promise.all([
     configMock.thenJson(200, configData),
@@ -370,65 +387,80 @@ describe('Load', function () {
       await sleeper(1);
     })
   })
-  describe('Ensure download list', function () {
-    it('must download channel list', async function () {
+  describe('Ensure channel CSV save', function () {
+    it('must post the channel list to OMERO as CSV', async function () {
       await sleeper(1);
-      const formPath = '/data/formData/download_channels.json';
-      // Check form parameters
-      const formCallback = (formData) => {
-        expect(formData).to.deep.equal(channelForm);
-      }
-      const toEl = fakeCreateElement(formCallback);
-      sinon.stub(document, 'createElement').callsFake(toEl);
+      // The channel CSV is now written to the OMERO image over fetch; it used
+      // to be a hidden-form POST that downloaded a file. Same payload as the
+      // old form (minus `filename`), but as real JSON rather than the form's
+      // stringified values -- so compare against the parsed fixture.
+      let sent: any = null;
+      const fetchStub = sinon.stub(window, 'fetch').callsFake((url, init) => {
+        const u = String(url);
+        if (u.indexOf('/list_omero_channel_csvs') !== -1) {
+          // No CSVs yet, so the name dialog shows no overwrite warning.
+          return Promise.resolve(new Response(JSON.stringify({csvs: []}),
+            {status: 200, headers: {'Content-Type': 'application/json'}}));
+        }
+        if (u.indexOf('/save_channels_csv_to_omero') !== -1) {
+          sent = JSON.parse(init.body);
+          return Promise.resolve(new Response(
+            JSON.stringify({success: true, rows: 0, name: sent.csv_name}),
+            {status: 200, headers: {'Content-Type': 'application/json'}}));
+        }
+        return (fetchStub as any).wrappedMethod.call(window, url, init);
+      });
+      const alertStub = sinon.stub(window, 'alert');   // success alert would block
       const cIcon = document.getElementById("channels_download_icon");
       cIcon.dispatchEvent(new Event('click'));
-      const called = (document.createElement as any).getCall(0);
-      expect(called.calledWith('form')).to.equal(true);
+      // Saving now goes through a "name the file" dialog; accept the default.
+      await sleeper(1);
+      const saveBtn = document.querySelector('.gater-picker-save') as HTMLButtonElement;
+      expect(saveBtn).to.not.equal(null);
+      saveBtn.click();
+      await sleeper(1);
+      expect(sent).to.not.equal(null);
+      expect(sent.csv_name).to.equal(`${channelForm.datasource}_channels.csv`);
+      expect(sent.overwrite).to.equal(false);
+      expect(sent.datasource).to.equal(channelForm.datasource);
+      ['active_channels', 'list_channels', 'map_channels',
+       'list_colors', 'list_ranges'].forEach((key) => {
+        expect(sent[key]).to.deep.equal(JSON.parse(channelForm[key]));
+      });
+      expect(alertStub.called).to.equal(true);
       sinon.restore();
       await sleeper(3);
     })
   })
-  describe('Ensure download ranges', function () {
-    it('must download channel ranges', async function () {
+  describe('Ensure gating range CSV save', function () {
+    it('must post gated channel ranges to OMERO', async function () {
       await sleeper(1);
-      const panel = document.getElementById('gating_download_panel');
-      const { csv_gatingList } = __minervaAnalysis;
-      csv_gatingList.download_panel_visible = true;
-      (panel as HTMLElement).style.visibility = 'visible';
-      // Check form parameters
-      const formCallback = (formData) => {
-        expect(formData).to.deep.equal(rangeForm);
-      }
-      const toEl = fakeCreateElement(formCallback);
-      sinon.stub(document, 'createElement').callsFake(toEl);
-      const gId = "download_gated_channel_ranges";
-      const gIcon = document.getElementById(gId);
-      gIcon.dispatchEvent(new Event('click'));
-      const called = (document.createElement as any).getCall(0);
-      expect(called.calledWith('form')).to.equal(true);
-      sinon.restore();
+      const sent = await saveGatingCsv(
+        'download_gated_channel_ranges', 'download_input1', 'ranges test.csv');
+      expect(sent).to.not.equal(null);
+      expect(sent.fullCsv).to.equal(false);
+      // Spaces are replaced so the stored name matches what OMERO displays.
+      expect(sent.csv_name).to.equal('ranges_test.csv');
+      expect(sent.overwrite).to.equal(false);
+      expect(sent.datasource).to.equal(rangeForm.datasource);
+      expect(sent.encoding).to.equal(rangeForm.encoding);
+      expect(sent.filter).to.deep.equal(JSON.parse(rangeForm.filter));
+      expect(sent.channels).to.deep.equal(JSON.parse(rangeForm.channels));
       await sleeper(3);
     })
   })
   describe('Ensure download encodings', function () {
-    it('must download cell encodings', async function () {
+    it('must post gated cell encodings to OMERO', async function () {
       await sleeper(1);
-      const panel = document.getElementById('gating_download_panel');
-      const { csv_gatingList } = __minervaAnalysis;
-      csv_gatingList.download_panel_visible = true;
-      (panel as HTMLElement).style.visibility = 'visible';
-      // Check form parameters
-      const formCallback = (formData) => {
-        expect(formData).to.deep.equal(encodingForm);
-      }
-      const toEl = fakeCreateElement(formCallback);
-      sinon.stub(document, 'createElement').callsFake(toEl);
-      const gId = "download_gated_cell_encodings";
-      const gIcon = document.getElementById(gId);
-      gIcon.dispatchEvent(new Event('click'));
-      const called = (document.createElement as any).getCall(0);
-      expect(called.calledWith('form')).to.equal(true);
-      sinon.restore();
+      const sent = await saveGatingCsv(
+        'download_gated_cell_encodings', 'download_input2', 'encodings.csv');
+      expect(sent).to.not.equal(null);
+      expect(sent.fullCsv).to.equal(true);
+      expect(sent.csv_name).to.equal('encodings.csv');
+      expect(sent.datasource).to.equal(encodingForm.datasource);
+      expect(sent.encoding).to.equal(encodingForm.encoding);
+      expect(sent.filter).to.deep.equal(JSON.parse(encodingForm.filter));
+      expect(sent.channels).to.deep.equal(JSON.parse(encodingForm.channels));
       await sleeper(3);
     })
   })

@@ -141,9 +141,17 @@
     font-size: 10px;
 }
 
+/* The "save gating as CSV" panel. Styled to match the .gater-picker dialogs
+   used by the channel CSV save, so the two OMERO save flows look like one
+   feature. It stays an inline panel rather than a centred modal because it
+   holds two named outputs plus the encoding choice, not a single prompt. */
 #gating_download_panel {
-    background-color: rgba(255, 255, 255, 1);
-    padding: 35px 10px 30px 10px;
+    background-color: rgba(0, 0, 0, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 4px;
+    box-sizing: border-box;
+    color: rgba(255, 255, 255, 1);
+    padding: 28px 20px 18px 20px;
     position: absolute;
     top: 19px;
     width: 98%;
@@ -152,42 +160,91 @@
 }
 
 #gating_download_panel #gating_exit {
+    color: rgba(255, 255, 255, 0.6);
     cursor: pointer;
-    font-size: 16px;
+    font-size: 14px;
     font-weight: lighter;
     position: absolute;
-    right: 5px;
-    top: 5px;
+    right: 9px;
+    top: 7px;
+}
+
+#gating_download_panel #gating_exit:hover {
+    color: rgba(255, 255, 255, 1);
 }
 
 #gating_download_panel label {
+    display: block;
     font-size: 12px;
+    margin-bottom: 10px;
     width: 100%;
 }
 
 #gating_download_panel .download_flex {
+    align-items: center;
     display: flex;
-    flex-flow: row wrap;
-    margin: 10px 0 5px 0;
+    flex-flow: row nowrap;
+    margin: 6px 0 0 0;
     width: 100%;
 }
 
 #gating_download_panel .download_flex input[type=text] {
-    background-color: rgba(255, 255, 255, 1);
-    border: 1px solid rgba(0, 0, 0, 1);
-    border-radius: 1px;
-    color: darkblue;
-    font-size: 10px;
-    padding: 5px;
-    width: 85%;
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 3px;
+    box-sizing: border-box;
+    color: rgba(255, 255, 255, 1);
+    flex: 1 1 auto;
+    font-size: 12px;
+    padding: 6px 8px;
 }
 
+#gating_download_panel .download_flex input[type=text]:focus {
+    border-color: #3B7A57;
+    outline: none;
+}
+
+/* Uses the same Font Awesome fa-file-download icon as the panel's own header
+   save button, so the two read as the same action. No rotation: the icon's
+   arrow already points down. */
 #gating_download_panel .download_button {
-    color: rgba(0, 0, 0, 1);
+    background-color: #3B7A57;
+    border-radius: 3px;
+    color: rgba(255, 255, 255, 1);
     cursor: pointer;
-    font-size: 18px;
-    margin: 0 0 0 7px;
-    transform: rotate(180deg);
+    flex: 0 0 auto;
+    font-size: 15px;
+    line-height: 1;
+    margin: 0 0 0 8px;
+    padding: 6px 10px;
+    text-decoration: none;
+}
+
+#gating_download_panel .download_button:hover {
+    background-color: #46916a;
+}
+
+/* Font Awesome is the svg-with-js build here, so it swaps the inner <span>
+   for an inline <svg>. Block display drops the inline baseline gap that would
+   otherwise make the green button taller than the icon. */
+#gating_download_panel .download_button svg {
+    display: block;
+}
+
+#gating_download_panel select {
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 3px;
+    color: rgba(255, 255, 255, 1);
+    font-size: 12px;
+    margin-top: 6px;
+    padding: 5px 8px;
+    width: 100%;
+}
+
+#gating_download_panel select option {
+    background-color: rgba(20, 20, 20, 1);
+    color: rgba(255, 255, 255, 1);
 }
 
 #gating_controls_panel {
@@ -212,4 +269,207 @@
 #gating_controls_panel input {
     height: 11px;
     margin: 1px 10px 0 5px;
+}
+
+/* --- OMERO CSV picker -----------------------------------------------------
+   Modal used by "Load Channels from a CSV on OMERO" to choose among the CSV
+   attachments on the image. Self-contained (built in channelList.js), so it
+   needs no CSS framework; colours follow the dark viewer panels above. */
+.gater-picker-overlay {
+    align-items: center;
+    background-color: rgba(0, 0, 0, 0.6);
+    display: flex;
+    height: 100%;
+    justify-content: center;
+    left: 0;
+    position: fixed;
+    top: 0;
+    width: 100%;
+    z-index: 2000;
+}
+
+.gater-picker {
+    background-color: rgba(0, 0, 0, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 4px;
+    color: rgba(255, 255, 255, 1);
+    max-height: 70vh;
+    max-width: 90vw;
+    overflow-y: auto;
+    padding: 18px 20px;
+    width: 460px;
+}
+
+.gater-picker h4 {
+    font-size: 15px;
+    margin: 0 0 4px 0;
+}
+
+.gater-picker-sub {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 12px;
+    margin: 0 0 12px 0;
+}
+
+.gater-picker-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.gater-picker-item {
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+    color: rgba(255, 255, 255, 1);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    padding: 8px 10px;
+    text-align: left;
+    width: 100%;
+}
+
+.gater-picker-item:hover {
+    background-color: rgba(255, 255, 255, 0.16);
+}
+
+.gater-picker-name {
+    font-size: 13px;
+    word-break: break-all;
+}
+
+.gater-picker-meta {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 11px;
+    margin-top: 2px;
+}
+
+.gater-picker-tag {
+    background-color: #3B7A57;
+    border-radius: 2px;
+    font-size: 10px;
+    margin-left: 6px;
+    padding: 1px 5px;
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.gater-picker-cancel {
+    background-color: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 3px;
+    color: rgba(255, 255, 255, 1);
+    cursor: pointer;
+    margin-top: 14px;
+    padding: 6px 14px;
+}
+
+.gater-picker-cancel:hover {
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+/* Name-the-file dialog used by "Save Channels as a CSV on OMERO". Shares the
+   overlay/box styling above. */
+.gater-picker-input {
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 3px;
+    box-sizing: border-box;
+    color: rgba(255, 255, 255, 1);
+    font-size: 13px;
+    padding: 7px 9px;
+    width: 100%;
+}
+
+.gater-picker-input:focus {
+    border-color: #3B7A57;
+    outline: none;
+}
+
+.gater-picker-warn {
+    color: #e8b23a;
+    font-size: 11.5px;
+    line-height: 1.4;
+    margin: 8px 0 0 0;
+}
+
+.gater-picker-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 14px;
+}
+
+.gater-picker-actions .gater-picker-cancel {
+    margin-top: 0;
+}
+
+.gater-picker-save {
+    background-color: #3B7A57;
+    border: 1px solid #3B7A57;
+    border-radius: 3px;
+    color: rgba(255, 255, 255, 1);
+    cursor: pointer;
+    padding: 6px 14px;
+}
+
+.gater-picker-save:hover {
+    background-color: #46916a;
+}
+
+.gater-picker-save:disabled {
+    background-color: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.2);
+    color: rgba(255, 255, 255, 0.4);
+    cursor: default;
+}
+
+.gater-picker-hint {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 11px;
+    margin: 6px 0 0 0;
+}
+
+/* Blocking "saving to OMERO" overlay. Covers the viewport so a slow save
+   cannot be re-triggered by impatient clicking. */
+.gater-busy-overlay {
+    cursor: progress;
+}
+
+.gater-busy {
+    text-align: left;
+    width: 420px;
+}
+
+.gater-busy-track {
+    background-color: rgba(255, 255, 255, 0.12);
+    border-radius: 2px;
+    height: 6px;
+    margin-top: 14px;
+    overflow: hidden;
+    position: relative;
+    width: 100%;
+}
+
+/* Indeterminate: the server cannot report a percentage, so the bar sweeps
+   rather than pretending to measure. */
+.gater-busy-bar {
+    animation: gater-busy-sweep 1.4s ease-in-out infinite;
+    background-color: #3B7A57;
+    border-radius: 2px;
+    height: 100%;
+    position: absolute;
+    width: 35%;
+}
+
+@keyframes gater-busy-sweep {
+    0%   { left: -35%; }
+    100% { left: 100%; }
+}
+
+.gater-busy-status {
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 11.5px;
+    margin: 8px 0 0 0;
 }

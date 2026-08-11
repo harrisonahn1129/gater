@@ -241,24 +241,13 @@ class ChannelList {
             await this.applyChannels('db');
         }
 
+        // Load a channel CSV that lives on the OMERO image (was: a local file
+        // picker uploading to the server's disk). Any CSV attached to the image
+        // is offered, not just the ones Gater wrote, so a table produced by
+        // another tool can be loaded too.
         let arrow = document.getElementById('channels_upload_icon')
-        arrow.onclick = function () {
-            let elem = document.getElementById('channels-upload-from-arrow');
-            if (elem && document.createEvent) {
-                let evt = document.createEvent("MouseEvents");
-                evt.initEvent("click", true, false);
-                elem.dispatchEvent(evt);
-            }
-        }
-        document.getElementById("channels-upload-from-arrow").onchange = async () => {
-            if (document.getElementById("channels-upload-from-arrow").files) {
-                let file = document.getElementById("channels-upload-from-arrow").files[0]
-                let formData = new FormData();
-                formData.append("file", file);
-                await this.dataLayer.submitChannelUpload(formData);
-                document.getElementById("channels-upload-from-arrow").value = []
-                await this.applyChannels('file');
-            }
+        arrow.onclick = async () => {
+            await this.loadChannelCsvFromOmero();
         }
 
         this.addDownloadEvents();
@@ -266,16 +255,23 @@ class ChannelList {
 
     /**
      * @function applyChannels
-     * Applies settings (from file or db) to the channels
-     * @parms {String} source Whether it is from new file upload or saved
+     * Applies channel settings (saved render state, or rows parsed from a CSV
+     * on OMERO) to the channel list.
+     * @param {String} source 'csv' to apply the rows passed in, anything else
+     *                        to fetch this datasource's saved state
+     * @param {Array}  providedChannels rows to apply when source === 'csv'
+     * @returns {Number} how many rows matched a channel in this image. A CSV
+     *                   from another image can parse fine yet match nothing, so
+     *                   the caller needs to be able to say so.
      */
-    async applyChannels(source) {
+    async applyChannels(source, providedChannels) {
         let channels;
-        if (source === 'file'){
-            channels = await this.dataLayer.getUploadedChannelCsvValues();
+        if (source === 'csv') {
+            channels = providedChannels || [];
         } else {
             channels = await this.dataLayer.getSavedChannelList();
         }
+        let applied = 0;
 
         let defaultRange = this.dataLayer.imageBitRange;
 
@@ -289,6 +285,7 @@ class ChannelList {
         // (reset-to-default) and flashed default<->saved.
         _.each(channels, col => {
             if (!this.sliders.get(col.channel)) return;
+            applied++;
 
             let fullName = this.dataLayer.getFullChannelName(col.channel);
             let channelIdx = imageChannels[fullName];
@@ -337,7 +334,259 @@ class ChannelList {
                 document.querySelector(`#channel-slider_${channelID}`).click();
             }
         })
+        return applied;
     }
+
+
+    /**
+     * @function loadChannelCsvFromOmero
+     * Lists the CSV attachments on this datasource's OMERO image, lets the user
+     * pick one, then applies it to the channel list.
+     */
+    async loadChannelCsvFromOmero() {
+        let csvs;
+        try {
+            csvs = await this.dataLayer.listOmeroChannelCsvs();
+        } catch (e) {
+            alert(e.message);
+            return;
+        }
+        if (!csvs.length) {
+            alert("No CSV files are attached to this image in OMERO.\n\n" +
+                "Use \"Save Channels as a CSV on OMERO\" to create one, or " +
+                "attach a channel CSV to the image in OMERO.web.");
+            return;
+        }
+
+        const chosen = await GaterCsvDialogs.pickOmeroCsv(csvs, {
+            title: 'Load channels from a CSV on OMERO',
+            subtitle: 'CSV files attached to this image.'
+        });
+        if (!chosen) return;                       // cancelled
+
+        let rows;
+        try {
+            rows = await this.dataLayer.getOmeroChannelCsvValues(chosen.id);
+        } catch (e) {
+            alert(e.message);
+            return;
+        }
+
+        const applied = await this.applyChannels('csv', rows);
+        if (!applied) {
+            // Parsed fine but nothing matched -- almost always a CSV whose
+            // channel names come from a different image.
+            alert(`Loaded "${chosen.name}", but none of its ${rows.length} ` +
+                `channel name(s) match this image's channels. Nothing changed.`);
+        }
+    }
+
+
+    /**
+     * @function saveChannelCsvToOmero
+     * Asks the user what to call the CSV (defaulting to <datasource>_channels.csv,
+     * warning if that name is already taken), then writes it to the OMERO image.
+     */
+    async saveChannelCsvToOmero() {
+        // Re-entry guard: one CSV save at a time (the server enforces this too,
+        // since a queued save ties up a thread from a small pool).
+        if (this._csvSaveInFlight) return;
+        this._csvSaveInFlight = true;
+        try {
+            await this._saveChannelCsvToOmero();
+        } finally {
+            this._csvSaveInFlight = false;
+        }
+    }
+
+
+    async _saveChannelCsvToOmero() {
+        // Existing names drive the "already exists" warning. If the list can't
+        // be fetched we still let the save proceed -- the server re-checks and
+        // returns 409, which is handled below.
+        let existing = [];
+        try {
+            existing = await this.dataLayer.listOmeroChannelCsvs();
+        } catch (e) {
+            console.log("Could not list existing CSVs on OMERO", e);
+        }
+
+        const chosen = await this.promptCsvName(
+            this.dataLayer.defaultChannelCsvName(), existing);
+        if (!chosen) return;                       // cancelled
+
+        const save = async (overwrite) => {
+            return this.dataLayer.saveChannelsCsvToOmero(
+                imageChannelsIdx,
+                this.currentChannels,
+                this.colorConnector,
+                this.rangeConnector,
+                this.image_channels,
+                chosen.name,
+                overwrite
+            );
+        };
+
+        const busy = GaterCsvDialogs.showSaveBusy(
+            `Saving "${chosen.name}" to OMERO`, 'Please wait.');
+        try {
+            const res = await save(chosen.overwrite);
+            busy.close();
+            alert(`Saved "${res.name || chosen.name}" to OMERO`);
+        } catch (e) {
+            busy.close();
+            if (e.exists) {
+                // Someone created this name between listing and saving.
+                const go = await GaterCsvDialogs.confirmDialog(
+                    'A CSV with this name already exists', e.message, 'Overwrite');
+                if (go) {
+                    const busy2 = GaterCsvDialogs.showSaveBusy(
+                        `Replacing "${chosen.name}" on OMERO`, 'Please wait.');
+                    try {
+                        const res = await save(true);
+                        alert(`Saved "${res.name || chosen.name}" to OMERO`);
+                    } catch (e2) {
+                        alert(e2.message);
+                    } finally {
+                        busy2.close();
+                    }
+                }
+                return;
+            }
+            alert(e.message);
+        }
+    }
+
+
+    /**
+     * @function promptCsvName
+     * Modal asking what to call the CSV. Warns live as the user types when the
+     * name is already taken, so the choice between overwriting and renaming is
+     * made in one step rather than via a second confirm dialog.
+     * Resolves {name, overwrite} or null if dismissed.
+     */
+    promptCsvName(defaultName, existing) {
+        return new Promise(resolve => {
+            // A CSV is known by ONE name -- filename, description and collision
+            // key alike -- so what the user sees here is exactly what OMERO
+            // will show. Shared with the gating panel so the two cannot drift.
+            const sanitize = GaterCsvDialogs.sanitize;
+            const canonical = GaterCsvDialogs.canonical;
+
+            // Only Gater's own CSVs can be replaced; a same-named attachment
+            // from elsewhere is in a different namespace, so saving would leave
+            // two files sharing a name. Warn differently for each case. Compare
+            // canonically, so a file saved under an older spelling (spaces kept
+            // in the description) still registers as the same name.
+            const mine = new Set((existing || []).filter(c => c.is_gater)
+                .map(c => canonical(c.description || c.name)));
+            const theirs = new Set((existing || []).filter(c => !c.is_gater)
+                .map(c => canonical(c.name)));
+
+            const overlay = document.createElement('div');
+            overlay.className = 'gater-picker-overlay';
+
+            const box = document.createElement('div');
+            box.className = 'gater-picker';
+            box.innerHTML =
+                '<h4>Save channels as a CSV on OMERO</h4>' +
+                '<p class="gater-picker-sub">Name the file. Saving a name that ' +
+                'already exists replaces that file.</p>';
+
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.className = 'gater-picker-input';
+            input.value = sanitize(defaultName);
+            box.appendChild(input);
+
+            const hint = document.createElement('p');
+            hint.className = 'gater-picker-hint';
+            hint.textContent = 'Spaces become “_” — OMERO stores the file under ' +
+                'this exact name.';
+            box.appendChild(hint);
+
+            const warn = document.createElement('p');
+            warn.className = 'gater-picker-warn';
+            warn.style.display = 'none';
+            box.appendChild(warn);
+
+            const actions = document.createElement('div');
+            actions.className = 'gater-picker-actions';
+            const cancel = document.createElement('button');
+            cancel.type = 'button';
+            cancel.className = 'gater-picker-cancel';
+            cancel.textContent = 'Cancel';
+            const saveBtn = document.createElement('button');
+            saveBtn.type = 'button';
+            saveBtn.className = 'gater-picker-save';
+            actions.appendChild(cancel);
+            actions.appendChild(saveBtn);
+            box.appendChild(actions);
+
+            let willOverwrite = false;
+            function refresh() {
+                // Substitute disallowed characters in place as the user types,
+                // so the box always shows the name that will be written.
+                GaterCsvDialogs.sanitizeInputInPlace(input);
+                const n = canonical(input.value);
+                saveBtn.disabled = !n;
+                if (n && mine.has(n)) {
+                    willOverwrite = true;
+                    warn.textContent =
+                        `"${n}" already exists on this image. Saving will replace it — ` +
+                        `use a different name to keep both.`;
+                    warn.style.display = 'block';
+                    saveBtn.textContent = 'Overwrite';
+                } else if (n && theirs.has(n)) {
+                    willOverwrite = false;
+                    warn.textContent =
+                        `An attachment called "${n}" already exists on this image but ` +
+                        `was not written by Gater, so it will not be replaced — you ` +
+                        `would end up with two files of the same name.`;
+                    warn.style.display = 'block';
+                    saveBtn.textContent = 'Save anyway';
+                } else {
+                    willOverwrite = false;
+                    warn.style.display = 'none';
+                    saveBtn.textContent = 'Save';
+                }
+            }
+
+            function submit() {
+                const n = canonical(input.value);
+                if (!n) return;
+                close();
+                resolve({name: n, overwrite: willOverwrite});
+            }
+            function close() {
+                document.removeEventListener('keydown', onKey);
+                overlay.remove();
+            }
+            function onKey(e) {
+                if (e.key === 'Escape') { close(); resolve(null); }
+            }
+
+            input.addEventListener('input', refresh);
+            input.addEventListener('keydown', e => {
+                if (e.key === 'Enter') { e.preventDefault(); submit(); }
+            });
+            saveBtn.onclick = submit;
+            cancel.onclick = () => { close(); resolve(null); };
+            overlay.onclick = e => {
+                if (e.target === overlay) { close(); resolve(null); }
+            };
+            document.addEventListener('keydown', onKey);
+
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+            refresh();
+            input.focus();
+            // Select the stem, not the .csv, so typing replaces just the name.
+            const dot = input.value.lastIndexOf('.');
+            input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+        });
+    }
+
 
 
      auto_channel(name) {
@@ -360,15 +609,13 @@ class ChannelList {
      *  Adds event listeners to upload/download buttons
      */
     addDownloadEvents() {
+        // Write the channel list as a NAMED CSV attachment on the OMERO image
+        // (was: a browser download). Same content as "Save Channels to OMERO",
+        // but as text/csv so it can be read in OMERO.web or a spreadsheet. The
+        // user names the file, so an image can carry several.
         const channels_download_icon = document.querySelector('#channels_download_icon');
-        channels_download_icon.addEventListener('click', () => {
-            this.dataLayer.downloadChannelsCSV(
-                imageChannelsIdx,
-                this.currentChannels,
-                this.colorConnector,
-                this.rangeConnector,
-                this.image_channels
-            );
+        channels_download_icon.addEventListener('click', async () => {
+            await this.saveChannelCsvToOmero();
         });
 
         const channels_download_icon_db = document.querySelector('#channels_download_icon_db');

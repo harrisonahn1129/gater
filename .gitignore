@@ -40,3 +40,6 @@ minerva_analysis/data
 */__pycache__/*
 *__pycache__*
 *.pyc
+
+# test
+/tests

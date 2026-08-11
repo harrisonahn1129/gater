@@ -324,6 +324,19 @@ _GATER_NS = {
     'channel_list': 'gater.vida.nyu/render-state/channel_list',
     'gating_list': 'gater.vida.nyu/render-state/gating_list',
     'config': 'gater.vida.nyu/config',
+    # Human-readable CSV exports. Same content as the render-state JSON above,
+    # but stored as text/csv so they can be downloaded straight from OMERO.web,
+    # opened in a spreadsheet, or handed to another tool. The JSON namespaces
+    # stay the machine-readable source of truth for restore.
+    #
+    # Each CSV kind gets its OWN namespace so a save of one kind can never
+    # replace a file of another kind that happens to share a name, and so the
+    # load pickers can tell which files they can actually read back.
+    'channel_csv': 'gater.vida.nyu/channel-csv',
+    'gating_csv': 'gater.vida.nyu/gating-csv',
+    # Per-cell gating export (one row per cell). An output only -- it cannot be
+    # loaded back as gates.
+    'gating_cells_csv': 'gater.vida.nyu/gating-cells-csv',
 }
 
 
@@ -367,25 +380,37 @@ def _gater_ann_name_of(ann):
         return ''
 
 
-def put_omero_json(image_id, kind, dataset_name, obj):
-    """Store obj as a JSON FileAnnotation on the OMERO Image, scoped to
-    (image, kind, dataset_name).
+def _safe_ann_filename(dataset_name):
+    """Filesystem/OMERO-safe stem for an annotation filename."""
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', str(dataset_name)).strip('_') or 'unnamed'
 
-    Identity model: the namespace (_GATER_NS[kind]) stays stable per kind -- so
-    discovery can find every Gater datasource on an image with one namespace
-    query -- while the annotation's DESCRIPTION carries the exact dataset_name.
-    A re-save of the SAME name replaces only its own annotation (and sweeps any
-    legacy nameless one from before re-keying); DIFFERENT names on the same
+
+def _put_omero_file(image_id, ns, dataset_name, filename, data, mimetype,
+                    label, sweep_legacy=True, name_matches=None):
+    """Store raw bytes as a FileAnnotation on the OMERO Image, scoped to
+    (image, ns, dataset_name). Shared by put_omero_json / put_omero_csv.
+
+    Identity model: the namespace stays stable per kind -- so discovery can find
+    every Gater datasource on an image with one namespace query -- while the
+    annotation's DESCRIPTION carries the exact dataset_name. A re-save of the
+    SAME name replaces only its own annotation; DIFFERENT names on the same
     image coexist. The new annotation is created BEFORE the old ones are
     removed, so data is never lost if the delete fails (readers pick the
     newest). Best-effort: returns True on success, False on any failure.
+
+    sweep_legacy also removes DESCRIPTION-less annotations in this namespace,
+    which migrates render-state/config entries written before (image, name)
+    re-keying. Pass False for namespaces that never had a legacy scheme (the
+    channel CSVs), so an unlabelled file there is never silently deleted.
+
+    name_matches overrides how an existing annotation is judged to be "the same
+    entry" (default: exact description match). The channel CSVs compare
+    canonical names so an entry stored under an older spelling is replaced
+    rather than duplicated.
     """
     global _omero_conn
-    ns = _GATER_NS[kind]
     name = str(dataset_name)
-    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', name).strip('_') or 'unnamed'
-    filename = 'gater_%s__%s.json' % (kind, safe)
-    data = json.dumps(_jsonable(obj), allow_nan=False, indent=2).encode('utf-8')
+    suffix = os.path.splitext(filename)[1] or '.dat'
     last_exc = None
     for attempt in range(2):
         tmp_path = None
@@ -395,22 +420,31 @@ def put_omero_json(image_id, kind, dataset_name, obj):
                 img = conn.getObject('Image', int(image_id))
                 if img is None:
                     raise ValueError("OMERO image %s not found" % image_id)
-                # Replace only this name's annotation (+ sweep legacy nameless).
+                # Replace only this name's annotation (+ optionally sweep any
+                # legacy nameless one).
+                targets = ('', name) if sweep_legacy else (name,)
+                match = name_matches or (lambda existing: existing in targets)
                 old_ids = [a.getId() for a in img.listAnnotations(ns=ns)
-                           if _gater_ann_name_of(a) in ('', name)]
-                fd, tmp_path = tempfile.mkstemp(suffix='.json', prefix='gater_')
-                with os.fdopen(fd, 'wb') as fh:
-                    fh.write(data)
+                           if match(_gater_ann_name_of(a))]
+                fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix='gater_')
+                if callable(data):
+                    # Streaming writer: lets a large export go straight to disk
+                    # instead of being held in memory as bytes first.
+                    os.close(fd)
+                    data(tmp_path)
+                else:
+                    with os.fdopen(fd, 'wb') as fh:
+                        fh.write(data)
                 file_ann = conn.createFileAnnfromLocalFile(
                     tmp_path, origFilePathAndName=filename,
-                    mimetype='application/json', ns=ns, desc=name)
+                    mimetype=mimetype, ns=ns, desc=name)
                 img.linkAnnotation(file_ann)
                 if old_ids:
                     conn.deleteObjects(
                         'Annotation', old_ids, deleteAnns=True, wait=True)
             return True
         except ValueError as exc:
-            print("put_omero_json (%s/%s): %s" % (kind, name, exc))
+            print("%s (%s): %s" % (label, name, exc))
             return False
         except Exception as exc:  # noqa: BLE001 - connection loss etc.
             last_exc = exc
@@ -428,8 +462,93 @@ def put_omero_json(image_id, kind, dataset_name, obj):
                     os.remove(tmp_path)
                 except Exception:
                     pass
-    print("put_omero_json (%s/%s) failed after retry: %s"
-          % (kind, name, last_exc))
+    print("%s (%s) failed after retry: %s" % (label, name, last_exc))
+    return False
+
+
+def put_omero_json(image_id, kind, dataset_name, obj):
+    """Store obj as a JSON FileAnnotation on the OMERO Image, scoped to
+    (image, kind, dataset_name). See _put_omero_file for the identity model."""
+    data = json.dumps(_jsonable(obj), allow_nan=False, indent=2).encode('utf-8')
+    return _put_omero_file(
+        image_id, _GATER_NS[kind], dataset_name,
+        'gater_%s__%s.json' % (kind, _safe_ann_filename(dataset_name)),
+        data, 'application/json', 'put_omero_json (%s)' % kind)
+
+
+def canonical_csv_name(raw, default_stem=None):
+    """The ONE name a channel CSV is known by -- used as the OMERO filename, as
+    the annotation description, and as the collision key.
+
+    Characters a filename cannot carry (spaces above all) become '_', so the
+    name the user types, the name stored, the name OMERO.web displays and the
+    name we compare against are all the same string. Keeping a raw description
+    alongside a sanitised filename is what previously let 'x 1.csv' and
+    'x_1.csv' both save as one file without ever colliding.
+
+    Substitution is one character for one, so a caller echoing this back into a
+    text input does not have to move the caret. Returns '' for an empty name
+    when no default_stem is given.
+    """
+    def _sub(v):
+        return re.sub(r'[^A-Za-z0-9._-]', '_', v)
+
+    name = _sub((raw or '').strip())
+    if not name and default_stem:
+        name = _sub('%s_channels' % str(default_stem).strip())
+    if not name:
+        return ''
+    if not name.lower().endswith('.csv'):
+        name += '.csv'
+    return name
+
+
+def put_omero_csv(image_id, kind, entry_name, payload):
+    """Store csv_text as a text/csv FileAnnotation on the OMERO Image.
+
+    Unlike the JSON annotations -- which are keyed by DATASOURCE name, one per
+    datasource -- a channel CSV is keyed by the name the USER gave it, so one
+    image can carry as many differently-named CSVs as they like. Re-saving the
+    same name replaces that one file (the caller confirms the overwrite first).
+
+    Replacement matches on the CANONICAL name, so a file saved under an older
+    scheme (raw description with spaces, or the datasource-keyed name from
+    before CSVs were user-named) is replaced rather than duplicated when the
+    user picks the name it displays under.
+
+    `payload` is CSV text/bytes, OR a DataFrame. Pass the DataFrame for large
+    exports: it is written straight to the temp file, so the CSV never exists
+    as a full str AND a full bytes copy in memory at once. On the per-cell
+    gating export -- one row per cell over the whole quantification table --
+    that difference is hundreds of megabytes.
+    """
+    if isinstance(payload, pd.DataFrame):
+        data = lambda path: payload.to_csv(path, index=False)
+    elif isinstance(payload, str):
+        data = payload.encode('utf-8')
+    else:
+        data = payload
+    name = canonical_csv_name(entry_name)
+    return _put_omero_file(
+        image_id, _GATER_NS[kind], name, name, data, 'text/csv',
+        'put_omero_csv (%s)' % kind, sweep_legacy=False,
+        name_matches=lambda existing: bool(existing) and
+        canonical_csv_name(existing) == name)
+
+
+def omero_csv_name_exists(image_id, kind, entry_name):
+    """True if this image already carries a Gater CSV that would be replaced by
+    saving under this name. Compares CANONICAL names, so a legacy annotation
+    whose description still holds spaces is recognised as the same file."""
+    ns = _GATER_NS[kind]
+    want = canonical_csv_name(entry_name)
+    if not want:
+        return False
+    for c in list_omero_csv_files(image_id):
+        if c['ns'] != ns:
+            continue
+        if canonical_csv_name(c['description'] or c['name']) == want:
+            return True
     return False
 
 
@@ -477,6 +596,236 @@ def get_omero_json(image_id, kind, dataset_name):
             print("get_omero_json (%s/%s): %s" % (kind, want, exc))
             return None
     return None
+
+
+# --- Channel CSV on OMERO (interchange format) ----------------------------
+# The channel list is ALSO stored as a plain CSV FileAnnotation so a researcher
+# can read it in OMERO.web, open it in a spreadsheet, or hand it to another
+# tool -- and so a CSV produced elsewhere can be loaded back into Gater. The
+# reader therefore accepts ANY CSV attached to the image, not just Gater's own.
+
+# Columns a channel CSV must carry, and defaults for the ones it may omit (so a
+# minimal channel/threshold table from another tool still loads).
+_CHANNEL_CSV_REQUIRED = ('channel', 'start', 'end')
+_CHANNEL_CSV_DEFAULTS = {'r': 255, 'g': 255, 'b': 255,
+                         'opacity': 1, 'channel_active': False}
+_CHANNEL_CSV_COLUMNS = ('channel', 'start', 'end', 'r', 'g', 'b',
+                        'opacity', 'channel_active')
+
+
+_NS_TO_KIND = {v: k for k, v in _GATER_NS.items()}
+
+
+def list_omero_csv_files(image_id, kind=None):
+    """Every CSV FileAnnotation attached to this OMERO image, newest first.
+
+    Not restricted to Gater's own namespaces: the point of the CSV path is that
+    a table produced by another tool (or by a collaborator) can be loaded too.
+    Each entry is {id, name, description, ns, size, gater_kind, is_gater}.
+
+    `kind` scopes what `is_gater` means: pass the kind the caller is about to
+    save or load ('channel_csv', 'gating_csv', ...) and only files of THAT kind
+    are flagged. That matters because is_gater drives the overwrite warning, and
+    a save only ever replaces within its own namespace -- flagging a file we
+    could not actually replace would promise an overwrite that never happens.
+    Metadata only -- no file bodies are read. Returns [] on any failure.
+    """
+    global _omero_conn
+    from omero.gateway import FileAnnotationWrapper
+    want_ns = _GATER_NS[kind] if kind else None
+    for attempt in range(2):
+        try:
+            out = []
+            with _omero_lock:
+                conn = _ensure_omero_connection()
+                img = conn.getObject('Image', int(image_id))
+                if img is None:
+                    return []
+                for a in img.listAnnotations():
+                    if not isinstance(a, FileAnnotationWrapper):
+                        continue
+                    fname = a.getFileName() or ''
+                    if not fname.lower().endswith('.csv'):
+                        continue
+                    ns = a.getNs() or ''
+                    out.append({
+                        'id': int(a.getId()),
+                        'name': fname,
+                        'description': _gater_ann_name_of(a),
+                        'ns': ns,
+                        'size': int(a.getFileSize() or 0),
+                        'gater_kind': _NS_TO_KIND.get(ns),
+                        'is_gater': (ns == want_ns) if want_ns
+                                    else (ns in _NS_TO_KIND),
+                    })
+            out.sort(key=lambda d: d['id'], reverse=True)
+            return out
+        except Exception as exc:  # noqa: BLE001 - connection loss etc.
+            if attempt == 0:
+                with _omero_lock:
+                    try:
+                        if _omero_conn is not None:
+                            _omero_conn.close()
+                    except Exception:
+                        pass
+                    _omero_conn = None
+                    _clear_omero_caches()
+                continue
+            print("list_omero_csv_files (%s): %s" % (image_id, exc))
+            return []
+    return []
+
+
+def _read_omero_csv_frame(image_id, ann_id):
+    """Read CSV FileAnnotation `ann_id` (which must be linked to `image_id`) into
+    a DataFrame with trimmed column names.
+
+    Raises ValueError with a user-readable message when the annotation is
+    missing, not linked to this image, or unreadable -- the caller turns that
+    into a 4xx the UI can display. Requiring the annotation to be linked to this
+    image keeps the read scoped to the image in hand rather than to any
+    annotation id a caller cares to name.
+    """
+    global _omero_conn
+    from omero.gateway import FileAnnotationWrapper
+    want = int(ann_id)
+    raw = None
+    last_exc = None
+    for attempt in range(2):
+        try:
+            with _omero_lock:
+                conn = _ensure_omero_connection()
+                img = conn.getObject('Image', int(image_id))
+                if img is None:
+                    raise ValueError("OMERO image %s not found" % image_id)
+                target = None
+                for a in img.listAnnotations():
+                    if isinstance(a, FileAnnotationWrapper) and int(a.getId()) == want:
+                        target = a
+                        break
+                if target is None:
+                    raise ValueError(
+                        "CSV attachment %s is not attached to this image." % want)
+                raw = b''.join(target.getFileInChunks())
+            break
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - connection loss etc.
+            last_exc = exc
+            with _omero_lock:
+                try:
+                    if _omero_conn is not None:
+                        _omero_conn.close()
+                except Exception:
+                    pass
+                _omero_conn = None
+                _clear_omero_caches()
+    if raw is None:
+        raise ValueError("Could not read the CSV from OMERO: %s" % last_exc)
+
+    try:
+        frame = pd.read_csv(io.BytesIO(raw))
+    except Exception as exc:  # noqa: BLE001 - malformed upload
+        raise ValueError("That attachment is not a readable CSV (%s)." % exc)
+    frame.columns = [str(c).strip() for c in frame.columns]
+    return frame
+
+
+def get_omero_channel_csv_records(image_id, ann_id):
+    """Read a CSV attachment and return it as the list-of-dicts the client's
+    applyChannels expects. See _read_omero_csv_frame for the error contract."""
+    frame = _read_omero_csv_frame(image_id, ann_id)
+
+    missing = [c for c in _CHANNEL_CSV_REQUIRED if c not in frame.columns]
+    if missing:
+        raise ValueError(
+            "This CSV is missing required column(s): %s. A channel CSV needs "
+            "at least %s." % (', '.join(missing), ', '.join(_CHANNEL_CSV_REQUIRED)))
+
+    for col, default in _CHANNEL_CSV_DEFAULTS.items():
+        if col not in frame.columns:
+            frame[col] = default
+
+    # Coerce to the types the client expects; drop rows without a usable range.
+    frame['channel'] = frame['channel'].astype(str).str.strip()
+    for col in ('start', 'end', 'r', 'g', 'b', 'opacity'):
+        frame[col] = pd.to_numeric(frame[col], errors='coerce')
+    frame = frame.dropna(subset=['channel', 'start', 'end'])
+    if frame.empty:
+        raise ValueError(
+            "No usable rows in this CSV (every row was missing a channel name "
+            "or a numeric start/end).")
+    for col, default in (('r', 255), ('g', 255), ('b', 255)):
+        frame[col] = frame[col].fillna(default).clip(0, 255).round().astype(int)
+    frame['opacity'] = frame['opacity'].fillna(1)
+    frame['channel_active'] = frame['channel_active'].map(_as_bool).fillna(False)
+
+    return _jsonable(frame[list(_CHANNEL_CSV_COLUMNS)].to_dict(orient='records'))
+
+
+# A gating CSV carries one row per gated channel, plus optional rows where
+# channel == 'Lasso' whose gate_start holds a polygon rather than a number.
+_GATING_CSV_REQUIRED = ('channel', 'gate_start', 'gate_end')
+_GATING_LASSO_CHANNEL = 'Lasso'
+
+
+def get_omero_gating_csv_records(image_id, ann_id):
+    """Read a CSV attachment and return it as the list-of-dicts the client's
+    applyGates expects.
+
+    Deliberately lighter-touch than the channel reader: beyond checking the
+    required columns and normalising gate_active, values pass through as
+    pandas parsed them, which is exactly what the old local-file path did. In
+    particular Lasso rows are left alone -- their gate_start is a polygon and
+    their gate_end is blank, so coercing or dropping non-numeric rows here
+    would silently discard every lasso.
+    """
+    frame = _read_omero_csv_frame(image_id, ann_id)
+
+    missing = [c for c in _GATING_CSV_REQUIRED if c not in frame.columns]
+    if missing:
+        # The per-cell gating export shares this picker but is not loadable;
+        # say so rather than leaving the user to guess.
+        raise ValueError(
+            "This CSV is missing required column(s): %s. A gating CSV needs at "
+            "least %s -- a per-cell gating export cannot be loaded back as gates."
+            % (', '.join(missing), ', '.join(_GATING_CSV_REQUIRED)))
+
+    if 'gate_active' not in frame.columns:
+        frame['gate_active'] = False
+    frame['channel'] = frame['channel'].astype(str).str.strip()
+    frame = frame[frame['channel'] != '']
+    if frame.empty:
+        raise ValueError("No usable rows in this CSV (no channel names).")
+
+    # A Lasso row's gate_start holds a polygon and its gate_end is blank, which
+    # makes the whole column object-dtype -- so a single lasso would otherwise
+    # deliver every OTHER row's gates to the client as strings ('100' rather
+    # than 100). Coerce the numeric rows only, leaving lassos untouched, and
+    # drop any non-lasso row whose range will not parse rather than letting a
+    # null through as a silent gate of zero.
+    is_lasso = frame['channel'] == _GATING_LASSO_CHANNEL
+    for col in ('gate_start', 'gate_end'):
+        frame.loc[~is_lasso, col] = pd.to_numeric(
+            frame.loc[~is_lasso, col], errors='coerce')
+    unusable = ~is_lasso & (frame['gate_start'].isna() | frame['gate_end'].isna())
+    frame = frame[~unusable]
+    if frame.empty:
+        raise ValueError(
+            "No usable rows in this CSV (no row had a numeric gate range).")
+
+    frame['gate_active'] = frame['gate_active'].map(_as_bool).fillna(False)
+
+    return _jsonable(frame.to_dict(orient='records'))
+
+
+def _as_bool(v):
+    """Interpret a CSV cell as a boolean ('True'/'true'/1/'yes' -> True)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v == v:      # not NaN
+        return bool(v)
+    return str(v).strip().lower() in ('true', '1', 'yes', 'y', 't')
 
 
 def list_omero_config_names(image_id):
@@ -1095,7 +1444,9 @@ def download_gating_csv(datasource_name, gates, channels, selection_ids, encodin
         load_ball_tree(datasource_name)
 
     csv = datasource.copy()
-    datasource_filter = datasource.copy()
+    # No second copy: this is only queried for matching ids, never mutated, and
+    # the quantification table can be hundreds of MB.
+    datasource_filter = datasource
 
     columns = []
     if 'idField' in config[datasource_name]['featureData'][0]:

@@ -66,16 +66,30 @@ class DataLayer {
         }
     }
 
-    async getUploadedChannelCsvValues() {
-        try {
-            let response = await fetch('/get_uploaded_channel_csv_values?' + new URLSearchParams({
-                datasource: datasource
-            }))
-            let response_data = await response.json();
-            return response_data;
-        } catch (e) {
-            console.log("Error Getting Uploaded Channels", e);
-        }
+    // --- Channel CSV on OMERO --------------------------------------------
+    // The channel CSV is an attachment on the datasource's OMERO image, not a
+    // file on disk. These throw on failure carrying the server's own message,
+    // so the caller can tell the user WHY (wrong columns, no OMERO image, ...).
+    // The .catch on json() covers a non-JSON error page, which would otherwise
+    // surface as an unhelpful parser error instead of the fallback text.
+
+    async listOmeroChannelCsvs() {
+        let response = await fetch('/list_omero_channel_csvs?' + new URLSearchParams({
+            datasource: datasource
+        }));
+        let body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || 'Could not list CSVs on OMERO.');
+        return body.csvs || [];
+    }
+
+    async getOmeroChannelCsvValues(annId) {
+        let response = await fetch('/get_omero_channel_csv_values?' + new URLSearchParams({
+            datasource: datasource,
+            ann_id: annId
+        }));
+        let body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || 'Could not read that CSV.');
+        return body;
     }
 
     async getSavedChannelList() {
@@ -90,69 +104,62 @@ class DataLayer {
         }
     }
 
-    downloadGatingCSV(channels, selections, lassos, selection_ids, fullCsv = false) {
-        let form = document.createElement("form");
-        form.action = "/download_gating_csv";
+    // --- Gating CSV on OMERO ----------------------------------------------
+    // Mirrors the channel CSV methods: the gating panel's two outputs are
+    // written as attachments on the OMERO image rather than downloaded.
 
-        form.method = "post";
+    // kind: 'gating_csv' (gate ranges, loadable back) or 'gating_cells_csv'
+    // (the per-cell export).
+    defaultGatingCsvName(fullCsv) {
+        return datasource + (fullCsv ? '_gated_cell_encodings.csv'
+                                     : '_gated_channel_ranges.csv');
+    }
 
-        let filename = '';
-        if (!fullCsv) {
-            filename = document.getElementById('download_input1').value;
-        }else{
-            filename = document.getElementById('download_input2').value;
+    async listOmeroGatingCsvs(kind) {
+        let response = await fetch('/list_omero_gating_csvs?' + new URLSearchParams({
+            datasource: datasource,
+            kind: kind || 'gating_csv'
+        }));
+        let body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || 'Could not list CSVs on OMERO.');
+        return body.csvs || [];
+    }
+
+    async getOmeroGatingCsvValues(annId) {
+        let response = await fetch('/get_omero_gating_csv_values?' + new URLSearchParams({
+            datasource: datasource,
+            ann_id: annId
+        }));
+        let body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || 'Could not read that CSV.');
+        return body;
+    }
+
+    // A 409 comes back as an Error with .exists = true so the caller can offer
+    // to overwrite instead of just reporting a failure.
+    async saveGatingCsvToOmero(channels, selections, lassos, selection_ids, fullCsv, csvName, overwrite) {
+        let response = await fetch('/save_gating_csv_to_omero', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                datasource: datasource,
+                filter: selections,
+                channels: channels,
+                lassos: lassos,
+                selection_ids: selection_ids,
+                fullCsv: !!fullCsv,
+                encoding: (document.getElementById('encoding') || {}).value,
+                csv_name: csvName,
+                overwrite: !!overwrite
+            })
+        });
+        let body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            let err = new Error(body.error || 'Could not save the CSV to OMERO.');
+            err.exists = !!body.exists;
+            throw err;
         }
-        let fileNameElemment = document.createElement("input");
-        fileNameElemment.type = "hidden";
-        fileNameElemment.value = _.toString(filename);
-        fileNameElemment.name = "filename";
-        form.appendChild(fileNameElemment);
-
-        let fullCsvElemment = document.createElement("input");
-        fullCsvElemment.type = "hidden";
-        fullCsvElemment.value = _.toString(fullCsv);
-        fullCsvElemment.name = "fullCsv";
-        form.appendChild(fullCsvElemment);
-
-        let encoding = document.getElementById('encoding').value;
-        let encodingElement = document.createElement("input");
-        encodingElement.type = "hidden";
-        encodingElement.value = _.toString(encoding);
-        encodingElement.name = "encoding";
-        form.appendChild(encodingElement);
-
-        let selectionsElement = document.createElement("input");
-        selectionsElement.type = "hidden";
-        selectionsElement.value = JSON.stringify(selections);
-        selectionsElement.name = "filter";
-        form.appendChild(selectionsElement);
-
-        let channelsElement = document.createElement("input");
-        channelsElement.type = "hidden";
-        channelsElement.value = JSON.stringify(channels);
-        channelsElement.name = "channels";
-        form.appendChild(channelsElement);
-
-        let lassosElement = document.createElement("input");
-        lassosElement.type = "hidden";
-        lassosElement.value = JSON.stringify(lassos);
-        lassosElement.name = "lassos";
-        form.appendChild(lassosElement);
-
-        let idsElement = document.createElement("input");
-        idsElement.type = "hidden";
-        idsElement.value = JSON.stringify(selection_ids);
-        idsElement.name = "selection_ids";
-        form.appendChild(idsElement);
-
-        let datasourceElement = document.createElement("input");
-        datasourceElement.type = "hidden";
-        datasourceElement.value = datasource;
-        datasourceElement.name = "datasource";
-        form.appendChild(datasourceElement);
-
-        document.body.appendChild(form);
-        form.submit()
+        return body;
     }
 
     async saveGatingList(channels, selections, lassos) {
@@ -180,56 +187,38 @@ class DataLayer {
         }
     }
 
-    downloadChannelsCSV(map_channels, active_channels, list_colors, list_ranges, list_channels) {
-        let form = document.createElement("form");
-        form.action = "/download_channels_csv";
+    // Default name offered when saving a channel CSV. Lives here because the
+    // datasource name is this layer's concern.
+    defaultChannelCsvName() {
+        return datasource + '_channels.csv';
+    }
 
-        form.method = "post";
-
-        let filename = datasource + '_channel_list';
-        let fileNameElemment = document.createElement("input");
-        fileNameElemment.type = "hidden";
-        fileNameElemment.value = _.toString(filename);
-        fileNameElemment.name = "filename";
-        form.appendChild(fileNameElemment);
-
-        let mapElement = document.createElement("input");
-        mapElement.type = "hidden";
-        mapElement.value = JSON.stringify(map_channels);
-        mapElement.name = "map_channels";
-        form.appendChild(mapElement);
-
-        let activeElement = document.createElement("input");
-        activeElement.type = "hidden";
-        activeElement.value = JSON.stringify(active_channels);
-        activeElement.name = "active_channels";
-        form.appendChild(activeElement);
-
-        let colorsElement = document.createElement("input");
-        colorsElement.type = "hidden";
-        colorsElement.value = JSON.stringify(list_colors);
-        colorsElement.name = "list_colors";
-        form.appendChild(colorsElement);
-
-        let rangesElement = document.createElement("input");
-        rangesElement.type = "hidden";
-        rangesElement.value = JSON.stringify(list_ranges);
-        rangesElement.name = "list_ranges";
-        form.appendChild(rangesElement);
-
-        let channelsElement = document.createElement("input");
-        channelsElement.type = "hidden";
-        channelsElement.value = JSON.stringify(list_channels);
-        channelsElement.name = "list_channels";
-        form.appendChild(channelsElement);
-
-        let datasourceElement = document.createElement("input");
-        datasourceElement.type = "hidden";
-        datasourceElement.value = datasource;
-        datasourceElement.name = "datasource";
-        form.appendChild(datasourceElement);
-        document.body.appendChild(form);
-        form.submit()
+    // csvName is the user's chosen file name; overwrite must be true to replace
+    // an existing one. A 409 comes back as an Error with .exists = true so the
+    // caller can offer to overwrite instead of just reporting a failure.
+    async saveChannelsCsvToOmero(map_channels, active_channels, list_colors, list_ranges, list_channels, csvName, overwrite) {
+        let response = await fetch('/save_channels_csv_to_omero', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                datasource: datasource,
+                map_channels: map_channels,
+                active_channels: active_channels,
+                list_colors: list_colors,
+                list_ranges: list_ranges,
+                list_channels: list_channels,
+                csv_name: csvName,
+                overwrite: !!overwrite
+            })
+        });
+        let body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            let err = new Error(body.error || 'Could not save the CSV to OMERO.');
+            err.exists = !!body.exists;
+            err.name_taken = body.name;
+            throw err;
+        }
+        return body;
     }
 
     async saveChannelList(map_channels, active_channels, list_colors, list_ranges, list_channels) {
@@ -269,34 +258,6 @@ class DataLayer {
             return distributions;
         } catch (e) {
             console.log("Error Getting Nearest Cell", e);
-        }
-    }
-
-    async submitGatingUpload(formData) {
-        try {
-            formData.append('datasource', datasource);
-            let response = await fetch('/upload_gates', {
-                method: "POST",
-                body: formData
-            })
-            let cell = await response.json();
-            return cell;
-        } catch (e) {
-            console.log("Error Getting Submitting Form Upload", e);
-        }
-    }
-
-    async submitChannelUpload(formData) {
-        try {
-            formData.append('datasource', datasource);
-            let response = await fetch('/upload_channels', {
-                method: "POST",
-                body: formData
-            })
-            let cell = await response.json();
-            return cell;
-        } catch (e) {
-            console.log("Error Getting Submitting Form Upload", e);
         }
     }
 

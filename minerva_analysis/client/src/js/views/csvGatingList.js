@@ -197,25 +197,12 @@ class CSVGatingList {
             return this.applyGates()
         });
 
-        // Adding upload when you press on the up arrow
+        // Load a gating CSV that lives on the OMERO image (was: a local file
+        // picker uploading to the server's disk). Any CSV attached to the image
+        // is offered, not just the ones Gater wrote.
         let arrow = document.getElementById('gating_upload_icon')
-        arrow.onclick = () => {
-            let elem = document.getElementById('gating-upload-from-arrow');
-            if (elem && document.createEvent) {
-                let evt = document.createEvent("MouseEvents");
-                evt.initEvent("click", true, false);
-                elem.dispatchEvent(evt);
-            }
-        }
-        document.getElementById("gating-upload-from-arrow").onchange = async () => {
-            if (document.getElementById("gating-upload-from-arrow").files) {
-                let file = document.getElementById("gating-upload-from-arrow").files[0]
-                let formData = new FormData();
-                formData.append("file", file);
-                await this.dataLayer.submitGatingUpload(formData);
-                document.getElementById("gating-upload-from-arrow").value = []
-                await this.applyGates('file')
-            }
+        arrow.onclick = async () => {
+            await this.loadGatingCsvFromOmero();
         }
 
         let arrow_db = document.getElementById('gating_upload_icon_db')
@@ -250,26 +237,38 @@ class CSVGatingList {
 
      /**
      * @function applyGates
-     * Applies settings (from file or db) to the gates in the tool
-     * @parms {String} source Whether it is from new file upload or saved
+     * Applies gating settings to the gates in the tool.
+     * @param {String} source 'csv' to apply the rows passed in, 'file' for a
+     *                        drag-and-dropped upload, anything else to fetch
+     *                        this datasource's saved state
+     * @param {Array}  providedGates rows to apply when source === 'csv'
+     * @returns {Number} how many rows matched a channel in this image (Lasso
+     *                   rows count too). A CSV from another image can parse
+     *                   fine yet match nothing, so the caller must be able to
+     *                   say so rather than appearing to succeed silently.
      */
-    async applyGates(source) {
+    async applyGates(source, providedGates) {
         let gates;
-        if (source === 'file'){
+        if (source === 'csv') {
+            gates = providedGates || [];
+        } else if (source === 'file'){
             gates = await this.dataLayer.getUploadedGatingCsvValues();
         } else {
             gates = await this.dataLayer.getSavedGatingList();
         }
+        let applied = 0;
 
         this.eventHandler.trigger(CSVGatingList.events.RESET_GATINGLIST)
          let list_uploaded_lassos = [];
         _.each(gates, async (col) => {
             if (col.channel == 'Lasso') {
                 list_uploaded_lassos.push(col);
+                applied++;
             } else {
                 let shortName = this.dataLayer.getShortChannelName(col.channel);
                 let channelID = this.gatingIDs[shortName];
                 if (this.sliders.get(shortName)) {
+                    applied++;
                     let toggle_off
                     if (!col.gate_active && col.channel in this.selections) {
                         toggle_off = true;
@@ -316,14 +315,166 @@ class CSVGatingList {
         this.eventHandler.trigger(CSVGatingList.events.GATING_BRUSH_END, this.selections);
 
         await this.seaDragonViewer.clear_lassos();
-        if (source === 'file'){
-            list_uploaded_lassos = list_uploaded_lassos.map(item => {
-                item['gate_start'] = JSON.parse(item['gate_start'].replace(/'/g, '"'));
-                return item;
-            });
+        // Lassos that came from a CSV carry their polygon as text (the saved
+        // state path already has it as an object). A malformed one is skipped
+        // rather than aborting the whole apply -- CSVs can come from anywhere.
+        if (source === 'file' || source === 'csv'){
+            list_uploaded_lassos = list_uploaded_lassos.reduce((acc, item) => {
+                try {
+                    if (typeof item['gate_start'] === 'string') {
+                        item['gate_start'] = JSON.parse(item['gate_start'].replace(/'/g, '"'));
+                    }
+                    acc.push(item);
+                } catch (e) {
+                    console.log("Skipping unreadable lasso in CSV", item, e);
+                    applied--;
+                }
+                return acc;
+            }, []);
         }
         for (let lasso of list_uploaded_lassos){
             await this.seaDragonViewer.upload_lasso(lasso);
+        }
+        return applied;
+    }
+
+
+    /**
+     * @function loadGatingCsvFromOmero
+     * Lists the CSV attachments on this datasource's OMERO image, lets the user
+     * pick one, then applies it to the gating list.
+     */
+    async loadGatingCsvFromOmero() {
+        let csvs;
+        try {
+            csvs = await this.dataLayer.listOmeroGatingCsvs('gating_csv');
+        } catch (e) {
+            alert(e.message);
+            return;
+        }
+        if (!csvs.length) {
+            alert("No CSV files are attached to this image in OMERO.\n\n" +
+                "Use the download panel's \"gated channel ranges\" button to " +
+                "create one, or attach a gating CSV to the image in OMERO.web.");
+            return;
+        }
+
+        const chosen = await GaterCsvDialogs.pickOmeroCsv(csvs, {
+            title: 'Load gating from a CSV on OMERO',
+            subtitle: 'CSV files attached to this image.',
+            tag: 'gating CSV'
+        });
+        if (!chosen) return;                       // cancelled
+
+        let rows;
+        try {
+            rows = await this.dataLayer.getOmeroGatingCsvValues(chosen.id);
+        } catch (e) {
+            alert(e.message);
+            return;
+        }
+
+        const applied = await this.applyGates('csv', rows);
+        if (!applied) {
+            // Parsed fine but nothing matched -- almost always a CSV whose
+            // channel names come from a different image.
+            alert(`Loaded "${chosen.name}", but none of its ${rows.length} ` +
+                `row(s) match this image's channels. Nothing changed.`);
+        }
+    }
+
+
+    /**
+     * @function saveGatingCsvToOmero
+     * Writes one of the download panel's two CSVs to the OMERO image, using the
+     * name in the panel's own input. Warns before replacing an existing file.
+     * @param {Boolean} fullCsv false = gate ranges, true = per-cell encodings
+     * @param {HTMLElement} nameInput the panel input holding the file name
+     */
+    async saveGatingCsvToOmero(fullCsv, nameInput) {
+        // Re-entry guard. The busy overlay already blocks the pointer, but a
+        // keyboard-activated button or a second panel could still get through,
+        // and one queued export is enough to tie up a server thread for a
+        // minute.
+        if (this._csvSaveInFlight) return;
+        this._csvSaveInFlight = true;
+        try {
+            await this._saveGatingCsvToOmero(fullCsv, nameInput);
+        } finally {
+            this._csvSaveInFlight = false;
+        }
+    }
+
+
+    async _saveGatingCsvToOmero(fullCsv, nameInput) {
+        // Show the canonical name in the input so what the user sees is what
+        // OMERO will store (spaces become '_').
+        const canonical = GaterCsvDialogs.canonical(
+            nameInput.value || this.dataLayer.defaultGatingCsvName(fullCsv));
+        nameInput.value = canonical;
+
+        const kind = fullCsv ? 'gating_cells_csv' : 'gating_csv';
+        let overwrite = false;
+        try {
+            const existing = await this.dataLayer.listOmeroGatingCsvs(kind);
+            const taken = existing.some(c => c.is_gater &&
+                GaterCsvDialogs.canonical(c.description || c.name) === canonical);
+            if (taken) {
+                const go = await GaterCsvDialogs.confirmDialog(
+                    'A CSV with this name already exists',
+                    `"${canonical}" already exists on this image. Saving will ` +
+                    `replace it — cancel to change the name first.`,
+                    'Overwrite');
+                if (!go) return;
+                overwrite = true;
+            }
+        } catch (e) {
+            // Listing failed; let the save proceed -- the server re-checks and
+            // returns 409, handled below.
+            console.log("Could not list existing CSVs on OMERO", e);
+        }
+
+        // The per-cell export walks the whole quantification table, so it can
+        // take a minute. Block the UI while it runs: without that the app looks
+        // frozen, and the retry clicks that invites are what queued up several
+        // saves and eventually crashed the server.
+        const busy = GaterCsvDialogs.showSaveBusy(
+            `Saving "${canonical}" to OMERO`,
+            fullCsv ? 'Per-cell exports cover every cell in the quantification '
+                      + 'table and can take a minute. Please wait.'
+                    : 'Please wait.');
+
+        const save = (force) => this.dataLayer.saveGatingCsvToOmero(
+            this.gating_channels, this.selections,
+            this.seaDragonViewer.list_lassos,
+            fullCsv ? this.seaDragonViewer.pickedIds : null,
+            fullCsv, canonical, force);
+
+        try {
+            const res = await save(overwrite);
+            busy.close();
+            alert(`Saved "${res.name || canonical}" to OMERO`);
+        } catch (e) {
+            busy.close();
+            if (e.exists) {
+                // Created between listing and saving.
+                const go = await GaterCsvDialogs.confirmDialog(
+                    'A CSV with this name already exists', e.message, 'Overwrite');
+                if (go) {
+                    const busy2 = GaterCsvDialogs.showSaveBusy(
+                        `Replacing "${canonical}" on OMERO`, 'Please wait.');
+                    try {
+                        const res = await save(true);
+                        alert(`Saved "${res.name || canonical}" to OMERO`);
+                    } catch (e2) {
+                        alert(e2.message);
+                    } finally {
+                        busy2.close();
+                    }
+                }
+                return;
+            }
+            alert(e.message);
         }
     }
 
@@ -478,14 +629,26 @@ class CSVGatingList {
             gating_download_panel.style.visibility = 'hidden';
         });
 
-        // Download gated channel ranges
-        download_gated_channel_ranges.addEventListener('click', () => {
-            this.dataLayer.downloadGatingCSV(this.gating_channels, this.selections, this.seaDragonViewer.list_lassos,false);
+        // Keep the CSV name boxes showing exactly what OMERO will store:
+        // spaces (and anything else a filename cannot carry) become '_' as the
+        // user types, matching the channel CSV naming dialog. The defaults come
+        // from the datasource name, which may itself contain spaces, so clean
+        // them once up front too.
+        [download_input1, download_input2].forEach(el => {
+            if (!el) return;
+            GaterCsvDialogs.sanitizeInputInPlace(el);
+            el.addEventListener('input', () => GaterCsvDialogs.sanitizeInputInPlace(el));
+        });
+
+        // Save gated channel ranges to OMERO (was: a browser download). The
+        // file name comes from this panel's own input.
+        download_gated_channel_ranges.addEventListener('click', async () => {
+            await this.saveGatingCsvToOmero(false, download_input1);
         })
 
-        // Download gated channel ranges
-        download_gated_cell_encodings.addEventListener('click', () => {
-            this.dataLayer.downloadGatingCSV(this.gating_channels, this.selections, this.seaDragonViewer.list_lassos, this.seaDragonViewer.pickedIds, true);
+        // Save gated cell encodings to OMERO, honouring the encoding select.
+        download_gated_cell_encodings.addEventListener('click', async () => {
+            await this.saveGatingCsvToOmero(true, download_input2);
         })
 
         // Toggle outlined / filled cell selections

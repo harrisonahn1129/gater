@@ -88,8 +88,8 @@ module.exports = function(config) {
       "/get_channel_gmm": `${SERVER}/get_channel_gmm`,
       "/get_ome_metadata": `${SERVER}/get_ome_metadata`,
       "/get_channel_names": `${SERVER}/get_channel_names`,
-      "/download_gating_csv": `${SERVER}/download_gating_csv`,
-      "/download_channels_csv": `${SERVER}/download_channels_csv`,
+      "/save_gating_csv_to_omero": `${SERVER}/save_gating_csv_to_omero`,
+      "/save_channels_csv_to_omero": `${SERVER}/save_channels_csv_to_omero`,
       "/get_database_description": `${SERVER}/get_database_description`,
     },
 
