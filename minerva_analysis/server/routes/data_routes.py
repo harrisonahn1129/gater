@@ -327,6 +327,15 @@ def save_channels_csv_to_omero():
     return jsonify(success=True, rows=int(len(csv)), name=name)
 
 
+def _only_gater_requested():
+    """only_gater=1 restricts the listing to files Gater wrote in the namespace
+    being asked about. The LOAD pickers pass it, so they offer only CSVs they
+    can actually read back. The SAVE flow does not: its name-collision check
+    needs to see every CSV on the image, including ones Gater did not write, to
+    warn when a name would collide with something it cannot replace."""
+    return request.args.get('only_gater') in ('1', 'true', 'True')
+
+
 @app.route('/list_omero_channel_csvs', methods=['GET'])
 def list_omero_channel_csvs():
     """CSV attachments on this datasource's OMERO image, for the load picker."""
@@ -334,8 +343,10 @@ def list_omero_channel_csvs():
     image_id, err = _omero_image_id_or_error(datasource)
     if err:
         return err
-    return serialize_and_submit_json(
-        {'csvs': data_model.list_omero_csv_files(image_id, 'channel_csv')})
+    csvs = data_model.list_omero_csv_files(image_id, 'channel_csv')
+    if _only_gater_requested():
+        csvs = [c for c in csvs if c['is_gater']]
+    return serialize_and_submit_json({'csvs': csvs})
 
 
 @app.route('/get_omero_channel_csv_values', methods=['GET'])
@@ -429,8 +440,12 @@ def list_omero_gating_csvs():
     image_id, err = _omero_image_id_or_error(datasource)
     if err:
         return err
-    return serialize_and_submit_json(
-        {'csvs': data_model.list_omero_csv_files(image_id, kind)})
+    csvs = data_model.list_omero_csv_files(image_id, kind)
+    if _only_gater_requested():
+        # Restricting to this kind also keeps the per-cell encoding exports out
+        # of the gate-ranges picker: they are an output and cannot be loaded.
+        csvs = [c for c in csvs if c['is_gater']]
+    return serialize_and_submit_json({'csvs': csvs})
 
 
 @app.route('/get_omero_gating_csv_values', methods=['GET'])

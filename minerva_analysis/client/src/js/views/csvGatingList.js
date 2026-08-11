@@ -347,22 +347,24 @@ class CSVGatingList {
     async loadGatingCsvFromOmero() {
         let csvs;
         try {
-            csvs = await this.dataLayer.listOmeroGatingCsvs('gating_csv');
+            // Only gate-range CSVs Gater saved. This also excludes the per-cell
+            // encoding exports, which live in their own namespace and cannot be
+            // loaded back as gates.
+            csvs = await this.dataLayer.listOmeroGatingCsvs('gating_csv', true);
         } catch (e) {
             alert(e.message);
             return;
         }
         if (!csvs.length) {
-            alert("No CSV files are attached to this image in OMERO.\n\n" +
-                "Use the download panel's \"gated channel ranges\" button to " +
-                "create one, or attach a gating CSV to the image in OMERO.web.");
+            alert("No gating CSVs have been saved to this image yet.\n\n" +
+                "Use \"Save gated channel ranges to OMERO\" in the save panel " +
+                "to create one.");
             return;
         }
 
         const chosen = await GaterCsvDialogs.pickOmeroCsv(csvs, {
             title: 'Load gating from a CSV on OMERO',
-            subtitle: 'CSV files attached to this image.',
-            tag: 'gating CSV'
+            subtitle: 'Gating CSVs saved to this image.'
         });
         if (!chosen) return;                       // cancelled
 

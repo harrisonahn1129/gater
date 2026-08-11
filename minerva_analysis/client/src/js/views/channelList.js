@@ -346,21 +346,23 @@ class ChannelList {
     async loadChannelCsvFromOmero() {
         let csvs;
         try {
-            csvs = await this.dataLayer.listOmeroChannelCsvs();
+            // Only channel CSVs Gater saved: other attachments on the image are
+            // not readable as a channel list, so offering them just invites an
+            // error.
+            csvs = await this.dataLayer.listOmeroChannelCsvs(true);
         } catch (e) {
             alert(e.message);
             return;
         }
         if (!csvs.length) {
-            alert("No CSV files are attached to this image in OMERO.\n\n" +
-                "Use \"Save Channels as a CSV on OMERO\" to create one, or " +
-                "attach a channel CSV to the image in OMERO.web.");
+            alert("No channel CSVs have been saved to this image yet.\n\n" +
+                "Use \"Save Channels as a CSV on OMERO\" to create one.");
             return;
         }
 
         const chosen = await GaterCsvDialogs.pickOmeroCsv(csvs, {
             title: 'Load channels from a CSV on OMERO',
-            subtitle: 'CSV files attached to this image.'
+            subtitle: 'Channel CSVs saved to this image.'
         });
         if (!chosen) return;                       // cancelled
 

@@ -73,10 +73,13 @@ class DataLayer {
     // The .catch on json() covers a non-JSON error page, which would otherwise
     // surface as an unhelpful parser error instead of the fallback text.
 
-    async listOmeroChannelCsvs() {
-        let response = await fetch('/list_omero_channel_csvs?' + new URLSearchParams({
-            datasource: datasource
-        }));
+    // onlyGater restricts the result to channel CSVs Gater wrote (what the load
+    // picker offers). Omit it for the save-name collision check, which must see
+    // every CSV on the image.
+    async listOmeroChannelCsvs(onlyGater) {
+        let params = {datasource: datasource};
+        if (onlyGater) params.only_gater = '1';
+        let response = await fetch('/list_omero_channel_csvs?' + new URLSearchParams(params));
         let body = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(body.error || 'Could not list CSVs on OMERO.');
         return body.csvs || [];
@@ -115,11 +118,11 @@ class DataLayer {
                                      : '_gated_channel_ranges.csv');
     }
 
-    async listOmeroGatingCsvs(kind) {
-        let response = await fetch('/list_omero_gating_csvs?' + new URLSearchParams({
-            datasource: datasource,
-            kind: kind || 'gating_csv'
-        }));
+    // onlyGater: see listOmeroChannelCsvs.
+    async listOmeroGatingCsvs(kind, onlyGater) {
+        let params = {datasource: datasource, kind: kind || 'gating_csv'};
+        if (onlyGater) params.only_gater = '1';
+        let response = await fetch('/list_omero_gating_csvs?' + new URLSearchParams(params));
         let body = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(body.error || 'Could not list CSVs on OMERO.');
         return body.csvs || [];

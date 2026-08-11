@@ -44,8 +44,9 @@
      * Modal listing the CSV attachments on the image. Resolves with the chosen
      * entry, or null if dismissed.
      * @param {Array}  csvs  entries from /list_omero_*_csvs
-     * @param {Object} opts  {title, subtitle, tag} - tag labels the files this
-     *                       panel wrote (entry.is_gater)
+     * @param {Object} opts  {title, subtitle, tag} - tag, if given, badges the
+     *                       entries this panel wrote (entry.is_gater); omit it
+     *                       when the list is already restricted to one kind
      */
     function pickOmeroCsv(csvs, opts) {
         opts = opts || {};
@@ -79,10 +80,13 @@
                 var nameEl = document.createElement('span');
                 nameEl.className = 'gater-picker-name';
                 nameEl.textContent = c.name;
-                if (c.is_gater) {
+                // Only badge rows when the caller asked for it. The load
+                // pickers list a single namespace, so every row would carry an
+                // identical chip -- noise rather than information.
+                if (opts.tag && c.is_gater) {
                     var tag = document.createElement('span');
                     tag.className = 'gater-picker-tag';
-                    tag.textContent = opts.tag || 'saved by Gater';
+                    tag.textContent = opts.tag;
                     nameEl.appendChild(tag);
                 }
                 item.appendChild(nameEl);
